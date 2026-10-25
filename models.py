@@ -1,3 +1,4 @@
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -22,6 +23,7 @@ class User(Base):
     email = Column(String(255), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
     role = Column(String(20), nullable=False, default="user")
+
     created_at = Column(
         DateTime(timezone=True),
         server_default=func.now(),
@@ -46,9 +48,20 @@ class Event(Base):
     title = Column(String(200), nullable=False)
     description = Column(Text, nullable=False)
     location = Column(String(255), nullable=False)
-    event_date = Column(DateTime(timezone=True), nullable=False)
+
+    event_date = Column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
     price = Column(Numeric(12, 2), nullable=False)
-    available_tickets = Column(Integer, nullable=False, default=0)
+
+    available_tickets = Column(
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
     image_url = Column(String(500), nullable=True)
 
     created_by = Column(
@@ -75,8 +88,19 @@ class Order(Base):
     )
 
     id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
-    event_id = Column(Integer, ForeignKey("events.id"), nullable=False)
+
+    user_id = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+    )
+
+    event_id = Column(
+        Integer,
+        ForeignKey("events.id"),
+        nullable=False,
+    )
+
     quantity = Column(Integer, nullable=False)
     total_price = Column(Numeric(12, 2), nullable=False)
     status = Column(String(20), nullable=False, default="pending")
@@ -96,11 +120,28 @@ class Payment(Base):
     __tablename__ = "payments"
 
     id = Column(Integer, primary_key=True, index=True)
-    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+
+    order_id = Column(
+        Integer,
+        ForeignKey("orders.id"),
+        nullable=False,
+    )
+
     amount = Column(Numeric(12, 2), nullable=False)
     payment_method = Column(String(50), nullable=True)
-    payment_status = Column(String(20), nullable=False, default="pending")
-    transaction_id = Column(String(255), unique=True, nullable=True)
+
+    payment_status = Column(
+        String(20),
+        nullable=False,
+        default="pending",
+    )
+
+    transaction_id = Column(
+        String(255),
+        unique=True,
+        nullable=True,
+    )
+
     paid_at = Column(DateTime(timezone=True), nullable=True)
 
     created_at = Column(
