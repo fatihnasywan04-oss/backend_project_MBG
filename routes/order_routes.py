@@ -40,8 +40,19 @@ class OrderHistoryResponse(OrderResponse):
     event_title: str
 
 
+class PaymentDetailResponse(BaseModel):
+    id: int
+    amount: Decimal
+    payment_method: str
+    payment_status: str
+    transaction_id: str | None = None
+    paid_at: datetime | None = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class OrderDetailResponse(OrderHistoryResponse):
-    pass
+    payment: PaymentDetailResponse | None = None
 
 
 def require_user(current_user: User) -> None:
@@ -140,7 +151,7 @@ def create_order(
                 ),
             )
 
-        # Stok belum dikurangi pada tahap pembuatan pesanan.
+        # Stok belum dikurangi saat pesanan dibuat.
         total_price = Decimal(str(event.price)) * data.quantity
 
         order = Order(
@@ -160,6 +171,7 @@ def create_order(
     except HTTPException:
         db.rollback()
         raise
+
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Database error saat membuat pesanan")
@@ -264,6 +276,7 @@ def get_order_detail(
                 Order.id == order_id,
                 Order.user_id == current_user.id,
             )
+            .with_for_update(of=Order)
         )
 
         if order is None:
@@ -276,11 +289,34 @@ def get_order_detail(
             db.commit()
             db.refresh(order)
 
-        return order_to_dict(order)
+        # Ambil pembayaran terbaru untuk pesanan ini.
+        payment = db.scalar(
+            select(Payment)
+            .where(Payment.order_id == order.id)
+            .order_by(Payment.id.desc())
+        )
+
+        result = order_to_dict(order)
+
+        result["payment"] = (
+            {
+                "id": payment.id,
+                "amount": payment.amount,
+                "payment_method": payment.payment_method,
+                "payment_status": payment.payment_status,
+                "transaction_id": payment.transaction_id,
+                "paid_at": payment.paid_at,
+            }
+            if payment is not None
+            else None
+        )
+
+        return result
 
     except HTTPException:
         db.rollback()
         raise
+
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Gagal mengambil detail pesanan")
@@ -314,7 +350,6 @@ def cancel_order(
                 detail="Pesanan tidak ditemukan",
             )
 
-        # Jika sudah lewat batas waktu, simpan sebagai cancelled.
         if expire_order_if_needed(db, order):
             db.commit()
             raise HTTPException(
@@ -353,6 +388,7 @@ def cancel_order(
     except HTTPException:
         db.rollback()
         raise
+
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Database error saat membatalkan pesanan")
