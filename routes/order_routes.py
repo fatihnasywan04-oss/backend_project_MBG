@@ -18,18 +18,10 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
 
 
-# =========================
-# REQUEST SCHEMA
-# =========================
-
 class OrderCreate(BaseModel):
     event_id: int = Field(gt=0)
     quantity: int = Field(gt=0)
 
-
-# =========================
-# RESPONSE SCHEMA
-# =========================
 
 class OrderResponse(BaseModel):
     id: int
@@ -51,23 +43,6 @@ class OrderDetailResponse(OrderHistoryResponse):
     pass
 
 
-# =========================
-# HELPER
-# =========================
-
-def order_to_dict(order: Order) -> dict:
-    return {
-        "id": order.id,
-        "user_id": order.user_id,
-        "event_id": order.event_id,
-        "event_title": order.event.title,
-        "quantity": order.quantity,
-        "total_price": order.total_price,
-        "status": order.status,
-        "created_at": order.created_at,
-    }
-
-
 def require_user(current_user: User) -> None:
     if current_user.role != "user":
         raise HTTPException(
@@ -84,11 +59,20 @@ def require_admin(current_user: User) -> None:
         )
 
 
-# =========================
-# MEMBUAT PESANAN
-# POST /orders/
-# =========================
+def order_to_dict(order: Order) -> dict:
+    return {
+        "id": order.id,
+        "user_id": order.user_id,
+        "event_id": order.event_id,
+        "event_title": order.event.title,
+        "quantity": order.quantity,
+        "total_price": order.total_price,
+        "status": order.status,
+        "created_at": order.created_at,
+    }
 
+
+# POST /orders/
 @router.post(
     "/",
     response_model=OrderResponse,
@@ -102,7 +86,7 @@ def create_order(
     require_user(current_user)
 
     try:
-        # Kunci baris event selama transaksi jika database mendukungnya.
+        # Ambil stok terkini dan kunci baris event.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -118,14 +102,14 @@ def create_order(
         if event.available_tickets < data.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Stok tiket tidak mencukupi",
+                detail=(
+                    "Stok tiket tidak mencukupi. "
+                    f"Sisa stok saat ini: {event.available_tickets}"
+                ),
             )
 
-        # Hitung total harga berdasarkan harga event terbaru.
+        # Stok diperiksa, tetapi TIDAK dikurangi di tahap ini.
         total_price = Decimal(str(event.price)) * data.quantity
-
-        # Kurangi stok dalam transaksi yang sama dengan pembuatan pesanan.
-        event.available_tickets -= data.quantity
 
         order = Order(
             user_id=current_user.id,
@@ -136,8 +120,6 @@ def create_order(
         )
 
         db.add(order)
-
-        # Simpan pengurangan stok dan pesanan secara bersamaan.
         db.commit()
         db.refresh(order)
 
@@ -150,7 +132,6 @@ def create_order(
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Database error saat membuat pesanan")
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pesanan gagal disimpan. Silakan coba lagi.",
@@ -159,18 +140,13 @@ def create_order(
     except Exception:
         db.rollback()
         logger.exception("Kesalahan saat membuat pesanan")
-
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Terjadi kesalahan saat membuat pesanan",
         )
 
 
-# =========================
-# RIWAYAT PESANAN USER
 # GET /orders/
-# =========================
-
 @router.get(
     "/",
     response_model=list[OrderHistoryResponse],
@@ -191,11 +167,7 @@ def get_my_orders(
     return [order_to_dict(order) for order in orders]
 
 
-# =========================
-# SEMUA PESANAN ADMIN
 # GET /orders/admin/all
-# =========================
-
 @router.get(
     "/admin/all",
     response_model=list[OrderHistoryResponse],
@@ -215,11 +187,7 @@ def get_all_orders_admin(
     return [order_to_dict(order) for order in orders]
 
 
-# =========================
-# DETAIL PESANAN USER
 # GET /orders/{order_id}
-# =========================
-
 @router.get(
     "/{order_id}",
     response_model=OrderDetailResponse,
