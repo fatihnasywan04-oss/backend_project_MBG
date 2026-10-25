@@ -107,11 +107,12 @@ def create_order(
         db.rollback()
         raise
 
-    except Exception:
+    except Exception as e:
         db.rollback()
+        print(f"ERROR CREATE ORDER: {repr(e)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Pesanan gagal disimpan",
+            detail=f"Pesanan gagal disimpan: {str(e)}",
         )
 
 
