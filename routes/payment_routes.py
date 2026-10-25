@@ -7,11 +7,12 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_validator
-from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy import select, update
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, joinedload
 
 from database import get_db
-from models import Order, Payment, User
+from models import Event, Order, Payment, User
 from routes.auth_routes import get_current_user
 
 
@@ -28,20 +29,15 @@ class PaymentCreate(BaseModel):
     @field_validator("payment_method", mode="before")
     @classmethod
     def normalize_payment_method(cls, value):
-        if not isinstance(value, str):
-            raise ValueError("Metode pembayaran harus berupa teks")
-
-        method = value.strip().lower().replace("-", "_").replace(" ", "_")
-
         aliases = {
-            "qris_payment": "qris",
-            "qr_is": "qris",
-            "ewallet": "e_wallet",
-            "e_wallet_payment": "e_wallet",
             "bank_transfer": "transfer_bank",
+            "ewallet": "e_wallet",
+            "e-wallet": "e_wallet",
+            "QRIS": "qris",
         }
-
-        return aliases.get(method, method)
+        if isinstance(value, str):
+            value = aliases.get(value, value)
+        return value
 
 
 class PaymentResponse(BaseModel):
@@ -56,16 +52,24 @@ class PaymentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+def require_user(current_user: User) -> None:
+    if current_user.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Fitur ini hanya tersedia untuk akun user",
+        )
+
+
 def make_payment_code(method: str) -> str:
-    # Kode untuk tampilan instruksi pembayaran.
-    # Kode ini tidak terhubung ke bank atau penyedia pembayaran.
-    if method == "qris":
-        return f"QR-{secrets.token_hex(8).upper()}"
-    if method == "e_wallet":
-        return f"EW-{secrets.randbelow(10**16):016d}"
-    return f"VA-{secrets.randbelow(10**16):016d}"
+    prefixes = {
+        "transfer_bank": "VA",
+        "e_wallet": "EW",
+        "qris": "QR",
+    }
+    return f"SIM-{prefixes[method]}-{secrets.token_hex(5).upper()}"
 
 
+# POST /payments/
 @router.post(
     "/",
     response_model=PaymentResponse,
@@ -76,11 +80,7 @@ def create_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Pembayaran hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
     try:
         order = db.scalar(
@@ -101,7 +101,7 @@ def create_payment(
         if order.status != "pending":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Pesanan ini tidak dapat dibayar lagi",
+                detail="Pesanan tidak lagi menunggu pembayaran",
             )
 
         existing_payment = db.scalar(
@@ -117,8 +117,7 @@ def create_payment(
                     detail="Pesanan ini sudah dibayar",
                 )
 
-            # Jika pembayaran pending sudah ada, gunakan kembali.
-            # Metode pembayaran tetap mengikuti pilihan awal.
+            # Gunakan kembali pembayaran pending yang sudah dibuat.
             return existing_payment
 
         payment = Payment(
@@ -133,23 +132,32 @@ def create_payment(
         db.add(payment)
         db.commit()
         db.refresh(payment)
+
         return payment
 
     except HTTPException:
         db.rollback()
         raise
-    except Exception:
+
+    except SQLAlchemyError:
         db.rollback()
-        logger.exception(
-            "Gagal membuat pembayaran untuk pesanan %s",
-            data.order_id,
-        )
+        logger.exception("Database error saat membuat pembayaran")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pembayaran gagal dibuat",
         )
 
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membuat pembayaran")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat membuat pembayaran",
+        )
 
+
+# POST /payments/{payment_id}/confirm
+# SIMULASI konfirmasi pembayaran, bukan verifikasi bank sungguhan.
 @router.post(
     "/{payment_id}/confirm",
     response_model=PaymentResponse,
@@ -159,20 +167,13 @@ def confirm_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Konfirmasi pembayaran hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
     try:
+        # Kunci payment.
         payment = db.scalar(
             select(Payment)
-            .join(Order, Payment.order_id == Order.id)
-            .where(
-                Payment.id == payment_id,
-                Order.user_id == current_user.id,
-            )
+            .where(Payment.id == payment_id)
             .with_for_update()
         )
 
@@ -182,9 +183,13 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan",
             )
 
+        # Kunci order milik user.
         order = db.scalar(
             select(Order)
-            .where(Order.id == payment.order_id)
+            .where(
+                Order.id == payment.order_id,
+                Order.user_id == current_user.id,
+            )
             .with_for_update()
         )
 
@@ -194,40 +199,81 @@ def confirm_payment(
                 detail="Pesanan tidak ditemukan",
             )
 
+        # Idempotensi: pembayaran sukses tidak boleh mengurangi stok lagi.
         if payment.payment_status == "success":
             return payment
 
         if payment.payment_status != "pending":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Status pembayaran tidak dapat dikonfirmasi",
+                detail="Pembayaran tidak berstatus pending",
             )
 
-        # Konfirmasi ini menyelesaikan alur demo aplikasi,
-        # bukan verifikasi pembayaran dari bank atau penyedia QRIS.
+        if order.status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Pesanan tidak lagi menunggu pembayaran",
+            )
+
+        # Kurangi stok secara atomik hanya jika stok terbaru mencukupi.
+        # Jika stok kurang, tidak ada perubahan stok.
+        result = db.execute(
+            update(Event)
+            .where(
+                Event.id == order.event_id,
+                Event.available_tickets >= order.quantity,
+            )
+            .values(
+                available_tickets=(
+                    Event.available_tickets - order.quantity
+                )
+            )
+        )
+
+        if result.rowcount != 1:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Stok tiket sudah tidak mencukupi. "
+                    "Pembayaran tidak dapat dikonfirmasi. "
+                    "Silakan pilih event atau jumlah tiket lain."
+                ),
+            )
+
+        # Perubahan stok, payment, dan order disimpan dalam
+        # satu transaksi yang sama.
         payment.payment_status = "success"
         payment.paid_at = datetime.now(timezone.utc)
         order.status = "paid"
 
         db.commit()
         db.refresh(payment)
+
         return payment
 
     except HTTPException:
         db.rollback()
         raise
-    except Exception:
+
+    except SQLAlchemyError:
         db.rollback()
-        logger.exception(
-            "Gagal mengonfirmasi pembayaran %s",
-            payment_id,
-        )
+        logger.exception("Database error saat konfirmasi pembayaran")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Pembayaran gagal dikonfirmasi",
+            detail="Konfirmasi pembayaran gagal diproses",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat konfirmasi pembayaran")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat konfirmasi pembayaran",
         )
 
 
+# GET /payments/
 @router.get(
     "/",
     response_model=list[PaymentResponse],
@@ -236,15 +282,13 @@ def get_my_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Riwayat pembayaran hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
-    return db.scalars(
+    payments = db.scalars(
         select(Payment)
         .join(Order, Payment.order_id == Order.id)
         .where(Order.user_id == current_user.id)
         .order_by(Payment.id.desc())
     ).all()
+
+    return payments
