@@ -1,8 +1,9 @@
 
 from datetime import datetime
+from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -20,7 +21,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 
 class OrderCreate(BaseModel):
     event_id: int
-    quantity: int
+    quantity: int = Field(gt=0)
 
 
 # =========================
@@ -32,7 +33,7 @@ class OrderResponse(BaseModel):
     user_id: int
     event_id: int
     quantity: int
-    total_price: float
+    total_price: Decimal
     status: str
     created_at: datetime
 
@@ -60,14 +61,9 @@ def create_order(
             detail="Pemesanan hanya tersedia untuk akun user",
         )
 
-    if data.quantity <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Jumlah tiket harus lebih dari 0",
-        )
-
     try:
-        # Kunci data event selama transaksi jika database mendukungnya.
+        # Ambil dan kunci event untuk mencegah stok
+        # yang sama dipesan secara bersamaan.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -80,22 +76,24 @@ def create_order(
                 detail="Event tidak ditemukan",
             )
 
-        if event.stock < data.quantity:
+        if event.available_tickets < data.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Stok tiket tidak mencukupi",
             )
 
+        total_price = Decimal(str(event.price)) * data.quantity
+
         order = Order(
             user_id=current_user.id,
             event_id=event.id,
             quantity=data.quantity,
-            total_price=event.price * data.quantity,
+            total_price=total_price,
             status="pending",
         )
 
-        # Kurangi stok sesuai jumlah tiket yang dipesan.
-        event.stock -= data.quantity
+        # Gunakan nama kolom sesuai models.py.
+        event.available_tickets -= data.quantity
 
         db.add(order)
         db.commit()
@@ -107,17 +105,21 @@ def create_order(
         db.rollback()
         raise
 
-    except Exception as e:
+    except Exception:
         db.rollback()
-        print(f"ERROR CREATE ORDER: {repr(e)}")
+        # Detail error disimpan di log server, bukan
+        # ditampilkan ke pengguna aplikasi.
+        import logging
+        logging.exception("Gagal membuat pesanan")
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Pesanan gagal disimpan: {str(e)}",
+            detail="Pesanan gagal disimpan. Silakan coba lagi.",
         )
 
 
 # =========================
-# DAFTAR PESANAN MILIK USER
+# DAFTAR PESANAN USER
 # GET /orders/
 # =========================
 
@@ -145,7 +147,7 @@ def get_my_orders(
 
 
 # =========================
-# DETAIL SATU PESANAN
+# DETAIL PESANAN USER
 # GET /orders/{order_id}
 # =========================
 
@@ -164,7 +166,6 @@ def get_order_detail(
             detail="Detail pesanan hanya tersedia untuk akun user",
         )
 
-    # Pastikan pesanan memang milik user yang sedang login.
     order = db.scalar(
         select(Order).where(
             Order.id == order_id,
