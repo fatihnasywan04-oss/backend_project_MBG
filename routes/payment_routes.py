@@ -1,7 +1,9 @@
 
-import uuid
 import logging
+import secrets
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_validator
@@ -12,19 +14,16 @@ from database import get_db
 from models import Order, Payment, User
 from routes.auth_routes import get_current_user
 
+
 router = APIRouter(prefix="/payments", tags=["Payments"])
 logger = logging.getLogger(__name__)
 
-ALLOWED_METHODS = {
-    "transfer_bank",
-    "e_wallet",
-    "qris",
-}
+PaymentMethod = Literal["transfer_bank", "e_wallet", "qris"]
 
 
 class PaymentCreate(BaseModel):
     order_id: int
-    payment_method: str
+    payment_method: PaymentMethod
 
     @field_validator("payment_method", mode="before")
     @classmethod
@@ -32,8 +31,7 @@ class PaymentCreate(BaseModel):
         if not isinstance(value, str):
             raise ValueError("Metode pembayaran harus berupa teks")
 
-        method = value.strip().lower()
-        method = method.replace("-", "_").replace(" ", "_")
+        method = value.strip().lower().replace("-", "_").replace(" ", "_")
 
         aliases = {
             "qris_payment": "qris",
@@ -43,26 +41,29 @@ class PaymentCreate(BaseModel):
             "bank_transfer": "transfer_bank",
         }
 
-        method = aliases.get(method, method)
-
-        if method not in ALLOWED_METHODS:
-            raise ValueError(
-                "Metode tidak valid. Gunakan transfer_bank, e_wallet, atau qris."
-            )
-
-        return method
+        return aliases.get(method, method)
 
 
 class PaymentResponse(BaseModel):
     id: int
     order_id: int
-    amount: float
+    amount: Decimal
     payment_method: str
     payment_status: str
     transaction_id: str | None
     paid_at: datetime | None
 
     model_config = ConfigDict(from_attributes=True)
+
+
+def make_payment_code(method: str) -> str:
+    # Kode untuk tampilan instruksi pembayaran.
+    # Kode ini tidak terhubung ke bank atau penyedia pembayaran.
+    if method == "qris":
+        return f"QR-{secrets.token_hex(8).upper()}"
+    if method == "e_wallet":
+        return f"EW-{secrets.randbelow(10**16):016d}"
+    return f"VA-{secrets.randbelow(10**16):016d}"
 
 
 @router.post(
@@ -100,51 +101,130 @@ def create_payment(
         if order.status != "pending":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Pesanan tidak dapat dibayar. Status saat ini: {order.status}",
+                detail="Pesanan ini tidak dapat dibayar lagi",
             )
 
         existing_payment = db.scalar(
-            select(Payment).where(
-                Payment.order_id == order.id
-            )
+            select(Payment)
+            .where(Payment.order_id == order.id)
+            .with_for_update()
         )
 
         if existing_payment is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Pembayaran untuk pesanan ini sudah pernah dibuat. "
-                    f"Status pembayaran: {existing_payment.payment_status}"
-                ),
-            )
+            if existing_payment.payment_status == "success":
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Pesanan ini sudah dibayar",
+                )
+
+            # Jika pembayaran pending sudah ada, gunakan kembali.
+            # Metode pembayaran tetap mengikuti pilihan awal.
+            return existing_payment
 
         payment = Payment(
             order_id=order.id,
             amount=order.total_price,
             payment_method=data.payment_method,
-            payment_status="success",  # SIMULASI SAJA
-            transaction_id=f"SIM-{uuid.uuid4().hex[:12].upper()}",
-            paid_at=datetime.now(timezone.utc),
+            payment_status="pending",
+            transaction_id=make_payment_code(data.payment_method),
+            paid_at=None,
         )
-
-        order.status = "paid"
 
         db.add(payment)
         db.commit()
         db.refresh(payment)
-
         return payment
 
     except HTTPException:
         db.rollback()
         raise
-
     except Exception:
         db.rollback()
-        logger.exception("Gagal menyimpan pembayaran untuk order %s", data.order_id)
+        logger.exception(
+            "Gagal membuat pembayaran untuk pesanan %s",
+            data.order_id,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Pembayaran gagal disimpan. Periksa log backend.",
+            detail="Pembayaran gagal dibuat",
+        )
+
+
+@router.post(
+    "/{payment_id}/confirm",
+    response_model=PaymentResponse,
+)
+def confirm_payment(
+    payment_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if current_user.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Konfirmasi pembayaran hanya tersedia untuk akun user",
+        )
+
+    try:
+        payment = db.scalar(
+            select(Payment)
+            .join(Order, Payment.order_id == Order.id)
+            .where(
+                Payment.id == payment_id,
+                Order.user_id == current_user.id,
+            )
+            .with_for_update()
+        )
+
+        if payment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pembayaran tidak ditemukan",
+            )
+
+        order = db.scalar(
+            select(Order)
+            .where(Order.id == payment.order_id)
+            .with_for_update()
+        )
+
+        if order is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pesanan tidak ditemukan",
+            )
+
+        if payment.payment_status == "success":
+            return payment
+
+        if payment.payment_status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Status pembayaran tidak dapat dikonfirmasi",
+            )
+
+        # Konfirmasi ini menyelesaikan alur demo aplikasi,
+        # bukan verifikasi pembayaran dari bank atau penyedia QRIS.
+        payment.payment_status = "success"
+        payment.paid_at = datetime.now(timezone.utc)
+        order.status = "paid"
+
+        db.commit()
+        db.refresh(payment)
+        return payment
+
+    except HTTPException:
+        db.rollback()
+        raise
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Gagal mengonfirmasi pembayaran %s",
+            payment_id,
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pembayaran gagal dikonfirmasi",
         )
 
 
@@ -162,11 +242,9 @@ def get_my_payments(
             detail="Riwayat pembayaran hanya tersedia untuk akun user",
         )
 
-    payments = db.scalars(
+    return db.scalars(
         select(Payment)
         .join(Order, Payment.order_id == Order.id)
         .where(Order.user_id == current_user.id)
         .order_by(Payment.id.desc())
     ).all()
-
-    return payments
