@@ -102,6 +102,7 @@ def create_order(
     require_user(current_user)
 
     try:
+        # Kunci baris event selama transaksi jika database mendukungnya.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -120,7 +121,11 @@ def create_order(
                 detail="Stok tiket tidak mencukupi",
             )
 
+        # Hitung total harga berdasarkan harga event terbaru.
         total_price = Decimal(str(event.price)) * data.quantity
+
+        # Kurangi stok dalam transaksi yang sama dengan pembuatan pesanan.
+        event.available_tickets -= data.quantity
 
         order = Order(
             user_id=current_user.id,
@@ -130,10 +135,9 @@ def create_order(
             status="pending",
         )
 
-        # Stok tidak dikurangi pada tahap pembuatan pesanan.
-        # Pengurangan harus dilakukan saat pembayaran dikonfirmasi
-        # atau saat sistem reservasi tiket diterapkan.
         db.add(order)
+
+        # Simpan pengurangan stok dan pesanan secara bersamaan.
         db.commit()
         db.refresh(order)
 
