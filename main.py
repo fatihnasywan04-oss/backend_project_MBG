@@ -13,14 +13,16 @@ from routes.payment_routes import router as payment_router
 
 
 app = FastAPI(
-    title="API Aplikasi Tiket",
+    title="API Event Ticketers",
     description="Backend aplikasi pembelian tiket event",
     version="1.0.0",
 )
 
 
-# Konfigurasi CORS untuk Flutter Web.
-# Untuk produksi, sesuaikan allow_origins dengan domain frontend.
+# =========================
+# KONFIGURASI CORS
+# =========================
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,13 +32,23 @@ app.add_middleware(
 )
 
 
+# =========================
+# HALAMAN UTAMA
+# GET /
+# =========================
+
 @app.get("/")
 def home():
     return {
-        "message": "Backend Aplikasi Tiket berhasil dijalankan",
+        "message": "Backend Event Ticketers berhasil dijalankan",
         "status": "success",
     }
 
+
+# =========================
+# HEALTH CHECK
+# GET /health
+# =========================
 
 @app.get("/health")
 def health():
@@ -44,6 +56,11 @@ def health():
         "status": "ok",
     }
 
+
+# =========================
+# CEK KONEKSI DATABASE
+# GET /health/database
+# =========================
 
 @app.get("/health/database")
 def check_database():
@@ -64,7 +81,10 @@ def check_database():
         )
 
 
-# Mendaftarkan setiap router satu kali.
+# =========================
+# REGISTRASI ROUTER
+# =========================
+
 app.include_router(auth_router)
 app.include_router(event_router)
 app.include_router(order_router)
