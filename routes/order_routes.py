@@ -1,6 +1,7 @@
 
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
@@ -15,18 +16,10 @@ from routes.auth_routes import get_current_user
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
 
-# =========================
-# REQUEST SCHEMA
-# =========================
-
 class OrderCreate(BaseModel):
     event_id: int
     quantity: int = Field(gt=0)
 
-
-# =========================
-# RESPONSE SCHEMA
-# =========================
 
 class OrderResponse(BaseModel):
     id: int
@@ -38,6 +31,10 @@ class OrderResponse(BaseModel):
     created_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class OrderDetailResponse(OrderResponse):
+    event_title: str
 
 
 # =========================
@@ -62,8 +59,6 @@ def create_order(
         )
 
     try:
-        # Ambil dan kunci event untuk mencegah stok
-        # yang sama dipesan secara bersamaan.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -92,7 +87,6 @@ def create_order(
             status="pending",
         )
 
-        # Gunakan nama kolom sesuai models.py.
         event.available_tickets -= data.quantity
 
         db.add(order)
@@ -107,9 +101,6 @@ def create_order(
 
     except Exception:
         db.rollback()
-        # Detail error disimpan di log server, bukan
-        # ditampilkan ke pengguna aplikasi.
-        import logging
         logging.exception("Gagal membuat pesanan")
 
         raise HTTPException(
@@ -119,7 +110,7 @@ def create_order(
 
 
 # =========================
-# DAFTAR PESANAN USER
+# DAFTAR PESANAN
 # GET /orders/
 # =========================
 
@@ -137,23 +128,21 @@ def get_my_orders(
             detail="Riwayat pesanan hanya tersedia untuk akun user",
         )
 
-    orders = db.scalars(
+    return db.scalars(
         select(Order)
         .where(Order.user_id == current_user.id)
         .order_by(Order.created_at.desc())
     ).all()
 
-    return orders
-
 
 # =========================
-# DETAIL PESANAN USER
+# DETAIL PESANAN
 # GET /orders/{order_id}
 # =========================
 
 @router.get(
     "/{order_id}",
-    response_model=OrderResponse,
+    response_model=OrderDetailResponse,
 )
 def get_order_detail(
     order_id: int,
@@ -167,7 +156,8 @@ def get_order_detail(
         )
 
     order = db.scalar(
-        select(Order).where(
+        select(Order)
+        .where(
             Order.id == order_id,
             Order.user_id == current_user.id,
         )
@@ -179,4 +169,13 @@ def get_order_detail(
             detail="Pesanan tidak ditemukan atau bukan milik akun ini",
         )
 
-    return order
+    return {
+        "id": order.id,
+        "user_id": order.user_id,
+        "event_id": order.event_id,
+        "event_title": order.event.title,
+        "quantity": order.quantity,
+        "total_price": order.total_price,
+        "status": order.status,
+        "created_at": order.created_at,
+    }
