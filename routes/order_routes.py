@@ -6,7 +6,8 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import Session, joinedload
 
 from database import get_db
 from models import Event, Order, User
@@ -14,6 +15,7 @@ from routes.auth_routes import get_current_user
 
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
+logger = logging.getLogger(__name__)
 
 
 # =========================
@@ -21,7 +23,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 # =========================
 
 class OrderCreate(BaseModel):
-    event_id: int
+    event_id: int = Field(gt=0)
     quantity: int = Field(gt=0)
 
 
@@ -45,8 +47,41 @@ class OrderHistoryResponse(OrderResponse):
     event_title: str
 
 
-class OrderDetailResponse(OrderResponse):
-    event_title: str
+class OrderDetailResponse(OrderHistoryResponse):
+    pass
+
+
+# =========================
+# HELPER
+# =========================
+
+def order_to_dict(order: Order) -> dict:
+    return {
+        "id": order.id,
+        "user_id": order.user_id,
+        "event_id": order.event_id,
+        "event_title": order.event.title,
+        "quantity": order.quantity,
+        "total_price": order.total_price,
+        "status": order.status,
+        "created_at": order.created_at,
+    }
+
+
+def require_user(current_user: User) -> None:
+    if current_user.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Fitur ini hanya tersedia untuk akun user",
+        )
+
+
+def require_admin(current_user: User) -> None:
+    if current_user.role != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Akses hanya untuk admin",
+        )
 
 
 # =========================
@@ -64,14 +99,9 @@ def create_order(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Pemesanan hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
     try:
-        # Kunci event saat memeriksa dan mengurangi kuota tiket.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -100,8 +130,9 @@ def create_order(
             status="pending",
         )
 
-        event.available_tickets -= data.quantity
-
+        # Stok tidak dikurangi pada tahap pembuatan pesanan.
+        # Pengurangan harus dilakukan saat pembayaran dikonfirmasi
+        # atau saat sistem reservasi tiket diterapkan.
         db.add(order)
         db.commit()
         db.refresh(order)
@@ -112,13 +143,22 @@ def create_order(
         db.rollback()
         raise
 
-    except Exception:
+    except SQLAlchemyError:
         db.rollback()
-        logging.exception("Gagal membuat pesanan")
+        logger.exception("Database error saat membuat pesanan")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pesanan gagal disimpan. Silakan coba lagi.",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membuat pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat membuat pesanan",
         )
 
 
@@ -135,31 +175,40 @@ def get_my_orders(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Riwayat pesanan hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
     orders = db.scalars(
         select(Order)
+        .options(joinedload(Order.event))
         .where(Order.user_id == current_user.id)
         .order_by(Order.created_at.desc())
     ).all()
 
-    return [
-        {
-            "id": order.id,
-            "user_id": order.user_id,
-            "event_id": order.event_id,
-            "event_title": order.event.title,
-            "quantity": order.quantity,
-            "total_price": order.total_price,
-            "status": order.status,
-            "created_at": order.created_at,
-        }
-        for order in orders
-    ]
+    return [order_to_dict(order) for order in orders]
+
+
+# =========================
+# SEMUA PESANAN ADMIN
+# GET /orders/admin/all
+# =========================
+
+@router.get(
+    "/admin/all",
+    response_model=list[OrderHistoryResponse],
+)
+def get_all_orders_admin(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    require_admin(current_user)
+
+    orders = db.scalars(
+        select(Order)
+        .options(joinedload(Order.event))
+        .order_by(Order.created_at.desc())
+    ).all()
+
+    return [order_to_dict(order) for order in orders]
 
 
 # =========================
@@ -176,14 +225,12 @@ def get_order_detail(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    if current_user.role != "user":
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Detail pesanan hanya tersedia untuk akun user",
-        )
+    require_user(current_user)
 
     order = db.scalar(
-        select(Order).where(
+        select(Order)
+        .options(joinedload(Order.event))
+        .where(
             Order.id == order_id,
             Order.user_id == current_user.id,
         )
@@ -195,13 +242,4 @@ def get_order_detail(
             detail="Pesanan tidak ditemukan atau bukan milik akun ini",
         )
 
-    return {
-        "id": order.id,
-        "user_id": order.user_id,
-        "event_id": order.event_id,
-        "event_title": order.event.title,
-        "quantity": order.quantity,
-        "total_price": order.total_price,
-        "status": order.status,
-        "created_at": order.created_at,
-    }
+    return order_to_dict(order)
