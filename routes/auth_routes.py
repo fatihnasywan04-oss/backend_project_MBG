@@ -1,3 +1,4 @@
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -21,7 +22,7 @@ router = APIRouter(
     tags=["Authentication"],
 )
 
-security = HTTPBearer()
+security = HTTPBearer(auto_error=False)
 
 
 # ==========================================
@@ -29,19 +30,51 @@ security = HTTPBearer()
 # ==========================================
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db),
 ):
-    token = credentials.credentials
+    if credentials is None or credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token autentikasi tidak ditemukan. Silakan login kembali.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    token = credentials.credentials.strip()
+
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token autentikasi kosong. Silakan login kembali.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     try:
         payload = decode_access_token(token)
-        user_id = int(payload["sub"])
 
-    except (jwt.InvalidTokenError, ValueError, KeyError, TypeError):
+        if not isinstance(payload, dict):
+            raise ValueError("Payload token tidak valid")
+
+        subject = payload.get("sub")
+
+        if subject is None:
+            raise ValueError("Token tidak memiliki subject")
+
+        user_id = int(subject)
+
+        if user_id <= 0:
+            raise ValueError("ID user tidak valid")
+
+    except (
+        jwt.InvalidTokenError,
+        ValueError,
+        KeyError,
+        TypeError,
+        OverflowError,
+    ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token tidak valid atau sudah kedaluwarsa",
+            detail="Token tidak valid atau sudah kedaluwarsa. Silakan login kembali.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -50,7 +83,8 @@ def get_current_user(
     if user is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Akun tidak ditemukan",
+            detail="Akun tidak ditemukan. Silakan login kembali.",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     return user
@@ -69,7 +103,14 @@ def register(
     data: RegisterRequest,
     db: Session = Depends(get_db),
 ):
-    email = str(data.email).lower()
+    email = str(data.email).strip().lower()
+    name = data.name.strip()
+
+    if not name:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nama tidak boleh kosong",
+        )
 
     existing_user = db.scalar(
         select(User).where(User.email == email)
@@ -82,7 +123,7 @@ def register(
         )
 
     user = User(
-        name=data.name.strip(),
+        name=name,
         email=email,
         password_hash=hash_password(data.password),
         role="user",
@@ -108,12 +149,15 @@ def register(
 # LOGIN ADMIN ATAU USER
 # ==========================================
 
-@router.post("/login", response_model=AuthResponse)
+@router.post(
+    "/login",
+    response_model=AuthResponse,
+)
 def login(
     data: LoginRequest,
     db: Session = Depends(get_db),
 ):
-    email = str(data.email).lower()
+    email = str(data.email).strip().lower()
 
     user = db.scalar(
         select(User).where(User.email == email)
@@ -126,6 +170,7 @@ def login(
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Email atau password salah",
+            headers={"WWW-Authenticate": "Bearer"},
         )
 
     token = create_access_token(
@@ -144,7 +189,10 @@ def login(
 # MELIHAT AKUN YANG SEDANG LOGIN
 # ==========================================
 
-@router.get("/me", response_model=UserResponse)
+@router.get(
+    "/me",
+    response_model=UserResponse,
+)
 def get_me(
     current_user: User = Depends(get_current_user),
 ):
