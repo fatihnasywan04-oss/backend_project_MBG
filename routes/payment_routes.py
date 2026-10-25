@@ -1,23 +1,23 @@
 
 import logging
 import secrets
-from datetime import datetime, timezone
-from decimal import Decimal
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, field_validator
 from sqlalchemy import select, update
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Event, Order, Payment, User
 from routes.auth_routes import get_current_user
 
-
 router = APIRouter(prefix="/payments", tags=["Payments"])
 logger = logging.getLogger(__name__)
+
+EXPIRATION_MINUTES = 15
 
 PaymentMethod = Literal["transfer_bank", "e_wallet", "qris"]
 
@@ -35,15 +35,17 @@ class PaymentCreate(BaseModel):
             "e-wallet": "e_wallet",
             "QRIS": "qris",
         }
+
         if isinstance(value, str):
             value = aliases.get(value, value)
+
         return value
 
 
 class PaymentResponse(BaseModel):
     id: int
     order_id: int
-    amount: Decimal
+    amount: float
     payment_method: str
     payment_status: str
     transaction_id: str | None
@@ -66,10 +68,44 @@ def make_payment_code(method: str) -> str:
         "e_wallet": "EW",
         "qris": "QR",
     }
+
     return f"SIM-{prefixes[method]}-{secrets.token_hex(5).upper()}"
 
 
-# POST /payments/
+def order_is_expired(order: Order) -> bool:
+    created_at = order.created_at
+
+    if created_at.tzinfo is None:
+        created_at = created_at.replace(tzinfo=timezone.utc)
+
+    return datetime.now(timezone.utc) >= (
+        created_at + timedelta(minutes=EXPIRATION_MINUTES)
+    )
+
+
+def fail_expired_order(
+    db: Session,
+    order: Order,
+    payment: Payment | None = None,
+) -> None:
+    order.status = "cancelled"
+
+    if payment is not None and payment.payment_status == "pending":
+        payment.payment_status = "failed"
+
+    other_payments = db.scalars(
+        select(Payment)
+        .where(
+            Payment.order_id == order.id,
+            Payment.payment_status == "pending",
+        )
+        .with_for_update()
+    ).all()
+
+    for item in other_payments:
+        item.payment_status = "failed"
+
+
 @router.post(
     "/",
     response_model=PaymentResponse,
@@ -104,6 +140,15 @@ def create_payment(
                 detail="Pesanan tidak lagi menunggu pembayaran",
             )
 
+        if order_is_expired(order):
+            fail_expired_order(db, order)
+            db.commit()
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Pesanan sudah kedaluwarsa. Silakan buat pesanan baru.",
+            )
+
         existing_payment = db.scalar(
             select(Payment)
             .where(Payment.order_id == order.id)
@@ -117,8 +162,14 @@ def create_payment(
                     detail="Pesanan ini sudah dibayar",
                 )
 
-            # Gunakan kembali pembayaran pending yang sudah dibuat.
-            return existing_payment
+            if existing_payment.payment_status == "pending":
+                # Gunakan kembali pembayaran pending yang sudah dibuat.
+                return existing_payment
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Pembayaran sebelumnya gagal. Buat pesanan baru.",
+            )
 
         payment = Payment(
             order_id=order.id,
@@ -138,7 +189,6 @@ def create_payment(
     except HTTPException:
         db.rollback()
         raise
-
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Database error saat membuat pembayaran")
@@ -147,17 +197,7 @@ def create_payment(
             detail="Pembayaran gagal dibuat",
         )
 
-    except Exception:
-        db.rollback()
-        logger.exception("Kesalahan saat membuat pembayaran")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Terjadi kesalahan saat membuat pembayaran",
-        )
 
-
-# POST /payments/{payment_id}/confirm
-# SIMULASI konfirmasi pembayaran, bukan verifikasi bank sungguhan.
 @router.post(
     "/{payment_id}/confirm",
     response_model=PaymentResponse,
@@ -170,24 +210,23 @@ def confirm_payment(
     require_user(current_user)
 
     try:
-        # Kunci payment.
-        payment = db.scalar(
+        # Kunci order terlebih dahulu agar konfirmasi tidak berlomba
+        # dengan pembatalan order pada transaksi lain.
+        payment_ref = db.scalar(
             select(Payment)
             .where(Payment.id == payment_id)
-            .with_for_update()
         )
 
-        if payment is None:
+        if payment_ref is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pembayaran tidak ditemukan",
             )
 
-        # Kunci order milik user.
         order = db.scalar(
             select(Order)
             .where(
-                Order.id == payment.order_id,
+                Order.id == payment_ref.order_id,
                 Order.user_id == current_user.id,
             )
             .with_for_update()
@@ -199,7 +238,22 @@ def confirm_payment(
                 detail="Pesanan tidak ditemukan",
             )
 
-        # Idempotensi: pembayaran sukses tidak boleh mengurangi stok lagi.
+        payment = db.scalar(
+            select(Payment)
+            .where(
+                Payment.id == payment_id,
+                Payment.order_id == order.id,
+            )
+            .with_for_update()
+        )
+
+        if payment is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pembayaran tidak ditemukan",
+            )
+
+        # Idempotensi: jangan kurangi stok dua kali.
         if payment.payment_status == "success":
             return payment
 
@@ -215,8 +269,16 @@ def confirm_payment(
                 detail="Pesanan tidak lagi menunggu pembayaran",
             )
 
-        # Kurangi stok secara atomik hanya jika stok terbaru mencukupi.
-        # Jika stok kurang, tidak ada perubahan stok.
+        if order_is_expired(order):
+            fail_expired_order(db, order, payment)
+            db.commit()
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Pesanan sudah kedaluwarsa. Silakan buat pesanan baru.",
+            )
+
+        # Kurangi stok secara atomik hanya jika stok mencukupi.
         result = db.execute(
             update(Event)
             .where(
@@ -236,13 +298,10 @@ def confirm_payment(
                 status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     "Stok tiket sudah tidak mencukupi. "
-                    "Pembayaran tidak dapat dikonfirmasi. "
-                    "Silakan pilih event atau jumlah tiket lain."
+                    "Pembayaran tidak dapat dikonfirmasi."
                 ),
             )
 
-        # Perubahan stok, payment, dan order disimpan dalam
-        # satu transaksi yang sama.
         payment.payment_status = "success"
         payment.paid_at = datetime.now(timezone.utc)
         order.status = "paid"
@@ -255,7 +314,6 @@ def confirm_payment(
     except HTTPException:
         db.rollback()
         raise
-
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Database error saat konfirmasi pembayaran")
@@ -264,16 +322,7 @@ def confirm_payment(
             detail="Konfirmasi pembayaran gagal diproses",
         )
 
-    except Exception:
-        db.rollback()
-        logger.exception("Kesalahan saat konfirmasi pembayaran")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Terjadi kesalahan saat konfirmasi pembayaran",
-        )
 
-
-# GET /payments/
 @router.get(
     "/",
     response_model=list[PaymentResponse],
@@ -284,11 +333,18 @@ def get_my_payments(
 ):
     require_user(current_user)
 
-    payments = db.scalars(
-        select(Payment)
-        .join(Order, Payment.order_id == Order.id)
-        .where(Order.user_id == current_user.id)
-        .order_by(Payment.id.desc())
-    ).all()
+    try:
+        return db.scalars(
+            select(Payment)
+            .join(Order, Payment.order_id == Order.id)
+            .where(Order.user_id == current_user.id)
+            .order_by(Payment.id.desc())
+        ).all()
 
-    return payments
+    except SQLAlchemyError:
+        db.rollback()
+        logger.exception("Gagal mengambil riwayat pembayaran")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Riwayat pembayaran gagal dimuat",
+        )
