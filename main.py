@@ -8,11 +8,10 @@ from database import engine
 
 from routes.auth_routes import router as auth_router
 from routes.event_routes import router as event_router
+from routes.ticket_class_routes import router as ticket_class_router
 from routes.order_routes import router as order_router
 from routes.payment_routes import router as payment_router
-from routes.event_routes import router as event_router
 from routes.admin_routes import router as admin_router
-
 
 
 app = FastAPI(
@@ -90,7 +89,7 @@ def check_database():
 
 app.include_router(auth_router)
 app.include_router(event_router)
+app.include_router(ticket_class_router)
 app.include_router(order_router)
 app.include_router(payment_router)
 app.include_router(admin_router)
-app.include_router(event_router)
