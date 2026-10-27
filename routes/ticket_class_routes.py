@@ -8,6 +8,7 @@ from database import get_db
 from models import Event, TicketClass, User
 from routes.auth_routes import get_current_user
 
+
 router = APIRouter(
     prefix="/events/{event_id}/ticket-classes",
     tags=["Ticket Classes"],
@@ -19,20 +20,26 @@ def require_admin(
 ):
     if current_user.role != "admin":
         raise HTTPException(
-            status_code=403,
+            status_code=status.HTTP_403_FORBIDDEN,
             detail="Akses hanya untuk admin",
         )
+
     return current_user
 
 
+# Nama kelas dibatasi 30 karakter agar konsisten dengan Flutter.
 class TicketClassCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=100)
+    name: str = Field(min_length=1, max_length=30)
     price: float = Field(ge=0)
     available_tickets: int = Field(ge=0)
 
 
 class TicketClassUpdate(BaseModel):
-    name: str | None = Field(default=None, min_length=1, max_length=100)
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=30,
+    )
     price: float | None = Field(default=None, ge=0)
     available_tickets: int | None = Field(default=None, ge=0)
 
@@ -42,13 +49,13 @@ def get_event_or_404(event_id: int, db: Session):
 
     if event is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Event tidak ditemukan",
         )
 
     if getattr(event, "is_cancelled", False):
         raise HTTPException(
-            status_code=400,
+            status_code=status.HTTP_400_BAD_REQUEST,
             detail="Event sudah dibatalkan",
         )
 
@@ -69,7 +76,7 @@ def get_ticket_class_or_404(
 
     if ticket_class is None:
         raise HTTPException(
-            status_code=404,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Kelas tiket tidak ditemukan",
         )
 
@@ -117,10 +124,17 @@ def create_ticket_class(
     get_event_or_404(event_id, db)
 
     name = data.name.strip()
+
     if not name:
         raise HTTPException(
-            status_code=422,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Nama kelas tiket wajib diisi",
+        )
+
+    if len(name) > 30:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nama kelas tiket maksimal 30 karakter",
         )
 
     duplicate = db.scalar(
@@ -132,7 +146,7 @@ def create_ticket_class(
 
     if duplicate:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail="Nama kelas tiket tersebut sudah digunakan",
         )
 
@@ -147,11 +161,14 @@ def create_ticket_class(
         db.add(ticket_class)
         db.commit()
         db.refresh(ticket_class)
+
         return serialize_ticket_class(ticket_class)
+
     except SQLAlchemyError:
         db.rollback()
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Kelas tiket gagal dibuat",
         )
 
@@ -176,16 +193,23 @@ def update_ticket_class(
 
     if not changes:
         raise HTTPException(
-            status_code=422,
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
             detail="Tidak ada data yang diubah",
         )
 
     if "name" in changes:
         name = (changes["name"] or "").strip()
+
         if not name:
             raise HTTPException(
-                status_code=422,
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
                 detail="Nama kelas tiket wajib diisi",
+            )
+
+        if len(name) > 30:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Nama kelas tiket maksimal 30 karakter",
             )
 
         duplicate = db.scalar(
@@ -195,31 +219,18 @@ def update_ticket_class(
                 TicketClass.id != ticket_class_id,
             )
         )
+
         if duplicate:
             raise HTTPException(
-                status_code=409,
+                status_code=status.HTTP_409_CONFLICT,
                 detail="Nama kelas tiket tersebut sudah digunakan",
             )
+
         changes["name"] = name
 
-    if "available_tickets" in changes:
-        # Jangan mengubah stok menjadi di bawah jumlah tiket yang
-        # sudah terjual. Untuk itu, stok awal dikurangi stok tersisa.
-        sold = (
-            db.query(TicketClass.available_tickets)
-            .filter(TicketClass.id == ticket_class_id)
-            .scalar()
-        )
-
-        # Catatan: available_tickets pada model ini adalah stok tersisa
-        # jika sistem pembayaran menguranginya saat transaksi berhasil.
-        # Validasi jumlah terjual yang akurat membutuhkan data transaksi
-        # paid berdasarkan ticket_class_id.
-        if changes["available_tickets"] < 0:
-            raise HTTPException(
-                status_code=422,
-                detail="Stok tidak boleh negatif",
-            )
+    # Schema sudah memvalidasi harga dan stok agar tidak negatif.
+    # Jangan mengubah aturan stok terjual tanpa memeriksa alur
+    # pemesanan dan pembayaran yang digunakan oleh aplikasi.
 
     try:
         for key, value in changes.items():
@@ -227,11 +238,14 @@ def update_ticket_class(
 
         db.commit()
         db.refresh(ticket_class)
+
         return serialize_ticket_class(ticket_class)
+
     except SQLAlchemyError:
         db.rollback()
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Kelas tiket gagal diperbarui",
         )
 
@@ -251,7 +265,7 @@ def delete_ticket_class(
         db,
     )
 
-    # Jangan hapus kelas tiket yang sudah dipakai oleh pesanan.
+    # Jangan menghapus kelas tiket yang sudah dipakai pesanan.
     from models import Order
 
     existing_order = db.scalar(
@@ -262,7 +276,7 @@ def delete_ticket_class(
 
     if existing_order is not None:
         raise HTTPException(
-            status_code=409,
+            status_code=status.HTTP_409_CONFLICT,
             detail=(
                 "Kelas tiket sudah memiliki pesanan dan tidak bisa "
                 "dihapus permanen. Ubah nama atau hentikan penjualannya."
@@ -272,10 +286,15 @@ def delete_ticket_class(
     try:
         db.delete(ticket_class)
         db.commit()
-        return {"message": "Kelas tiket berhasil dihapus"}
+
+        return {
+            "message": "Kelas tiket berhasil dihapus"
+        }
+
     except SQLAlchemyError:
         db.rollback()
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Kelas tiket gagal dihapus",
         )
