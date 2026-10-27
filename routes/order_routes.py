@@ -1,4 +1,3 @@
-
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,15 +12,17 @@ from database import get_db
 from models import Event, Order, Payment, TicketClass, User
 from routes.auth_routes import get_current_user
 
+
 router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
 
-EXPIRATION_MINUTES = 15
+# Batas pembayaran: 30 detik
+EXPIRATION_SECONDS = 30
 
 
-# =========================
+# ============================================================
 # SCHEMAS
-# =========================
+# ============================================================
 
 class OrderCreate(BaseModel):
     event_id: int = Field(gt=0)
@@ -62,9 +63,9 @@ class OrderDetailResponse(OrderHistoryResponse):
     payment: PaymentDetailResponse | None = None
 
 
-# =========================
+# ============================================================
 # AUTHORIZATION
-# =========================
+# ============================================================
 
 def require_user(current_user: User) -> None:
     if current_user.role != "user":
@@ -82,9 +83,9 @@ def require_admin(current_user: User) -> None:
         )
 
 
-# =========================
+# ============================================================
 # TIME / EXPIRATION
-# =========================
+# ============================================================
 
 def as_utc(value: datetime) -> datetime:
     """
@@ -99,15 +100,17 @@ def as_utc(value: datetime) -> datetime:
 
 def order_deadline(order: Order) -> datetime:
     """
-    Gunakan expires_at untuk order baru.
+    Mengambil batas waktu pembayaran.
+
+    Order baru menggunakan expires_at.
     Order lama yang belum memiliki expires_at menggunakan
-    created_at + 15 menit.
+    created_at + 30 detik.
     """
     if order.expires_at is not None:
         return as_utc(order.expires_at)
 
     return as_utc(order.created_at) + timedelta(
-        minutes=EXPIRATION_MINUTES
+        seconds=EXPIRATION_SECONDS
     )
 
 
@@ -120,11 +123,12 @@ def expire_order_if_needed(
     order: Order,
 ) -> bool:
     """
-    Kedaluwarsakan order pending yang sudah melewati tenggat.
-    Tidak mengubah order yang sudah paid atau cancelled.
+    Membatalkan order pending yang sudah melewati batas waktu.
 
-    Stok tidak dikembalikan di sini karena stok dalam alur ini
-    baru dikurangi ketika pembayaran berhasil.
+    Order yang sudah paid atau cancelled tidak diubah.
+
+    Stok tidak perlu dikembalikan karena stok baru dikurangi
+    saat pembayaran berhasil dikonfirmasi.
     """
     if order.status != "pending":
         return False
@@ -149,9 +153,9 @@ def expire_order_if_needed(
     return True
 
 
-# =========================
+# ============================================================
 # RESPONSE HELPER
-# =========================
+# ============================================================
 
 def order_to_dict(order: Order) -> dict:
     return {
@@ -168,9 +172,9 @@ def order_to_dict(order: Order) -> dict:
     }
 
 
-# =========================
+# ============================================================
 # CREATE ORDER
-# =========================
+# ============================================================
 
 @router.post(
     "/",
@@ -265,11 +269,12 @@ def create_order(
             total_price=unit_price * data.quantity,
             status="pending",
             expires_at=now + timedelta(
-                minutes=EXPIRATION_MINUTES
+                seconds=EXPIRATION_SECONDS
             ),
         )
 
-        # Stok belum dikurangi di tahap ini.
+        # Stok tidak dikurangi saat order dibuat.
+        # Stok hanya dikurangi ketika pembayaran berhasil.
         db.add(order)
         db.commit()
         db.refresh(order)
@@ -290,9 +295,9 @@ def create_order(
         )
 
 
-# =========================
+# ============================================================
 # GET MY ORDERS
-# =========================
+# ============================================================
 
 @router.get(
     "/",
@@ -337,9 +342,9 @@ def get_my_orders(
         )
 
 
-# =========================
+# ============================================================
 # GET ALL ORDERS (ADMIN)
-# =========================
+# ============================================================
 
 @router.get(
     "/admin/all",
@@ -383,9 +388,9 @@ def get_all_orders_admin(
         )
 
 
-# =========================
+# ============================================================
 # GET ORDER DETAIL
-# =========================
+# ============================================================
 
 @router.get(
     "/{order_id}",
@@ -458,9 +463,9 @@ def get_order_detail(
         )
 
 
-# =========================
+# ============================================================
 # CANCEL ORDER
-# =========================
+# ============================================================
 
 @router.delete("/{order_id}")
 def cancel_order(
