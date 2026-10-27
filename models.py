@@ -95,7 +95,7 @@ class TicketClass(Base):
         nullable=False,
         index=True,
     )
-    name = Column(String(30), nullable=False)
+    name = Column(String(100), nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
     available_tickets = Column(Integer, nullable=False, default=0)
 

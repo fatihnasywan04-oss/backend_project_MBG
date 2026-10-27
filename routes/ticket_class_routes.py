@@ -86,6 +86,7 @@ def serialize_ticket_class(ticket_class: TicketClass):
     }
 
 
+@router.get("")
 @router.get("/")
 def get_ticket_classes(
     event_id: int,
@@ -105,6 +106,7 @@ def get_ticket_classes(
     ]
 
 
+@router.post("", status_code=status.HTTP_201_CREATED)
 @router.post("/", status_code=status.HTTP_201_CREATED)
 def create_ticket_class(
     event_id: int,
