@@ -1,13 +1,15 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, field_validator
-from sqlalchemy import select, update
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+from sqlalchemy import select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Event, Order, Payment, TicketClass
+from models import Order, Payment, User
 from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
 
@@ -16,18 +18,26 @@ router = APIRouter(
     tags=["Payments"],
 )
 
-# Harus sama dengan batas waktu di routes/orders.py.
+logger = logging.getLogger(__name__)
+
+# Harus sama dengan EXPIRATION_SECONDS di order_routes.py.
 EXPIRATION_SECONDS = 60
 
 
+# ============================================================
+# SCHEMAS
+# ============================================================
+
 class PaymentCreate(BaseModel):
-    order_id: int
+    order_id: int = Field(gt=0)
+
     payment_method: Literal[
         "transfer_bank",
         "e_wallet",
         "qris",
     ]
-    payment_provider: str
+
+    payment_provider: str = Field(min_length=1, max_length=100)
 
     @field_validator("payment_method", mode="before")
     @classmethod
@@ -46,6 +56,16 @@ class PaymentCreate(BaseModel):
 
         return aliases.get(normalized, normalized)
 
+    @field_validator("payment_provider")
+    @classmethod
+    def normalize_payment_provider(cls, value):
+        value = value.strip()
+
+        if not value:
+            raise ValueError("Payment provider tidak boleh kosong.")
+
+        return value
+
 
 class PaymentResponse(BaseModel):
     id: int
@@ -61,6 +81,10 @@ class PaymentResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+# ============================================================
+# TIME HELPERS
+# ============================================================
+
 def utc_now() -> datetime:
     """Menghasilkan waktu UTC."""
     return datetime.now(timezone.utc)
@@ -68,7 +92,7 @@ def utc_now() -> datetime:
 
 def as_utc(value: datetime | None) -> datetime | None:
     """
-    Mengubah datetime menjadi UTC.
+    Normalisasi datetime ke UTC.
 
     Jika database menyimpan datetime tanpa timezone,
     nilainya diasumsikan sudah menggunakan UTC.
@@ -84,10 +108,11 @@ def as_utc(value: datetime | None) -> datetime | None:
 
 def order_deadline(order: Order) -> datetime | None:
     """
-    Menggunakan expires_at dari pesanan.
+    Mengambil batas waktu pembayaran.
 
-    Jika expires_at belum tersedia, batas waktu dihitung
-    dari created_at + 30 detik.
+    Menggunakan expires_at jika tersedia.
+    Untuk pesanan lama tanpa expires_at, gunakan
+    created_at + EXPIRATION_SECONDS.
     """
     expires_at = getattr(order, "expires_at", None)
 
@@ -104,7 +129,9 @@ def order_deadline(order: Order) -> datetime | None:
     if created_at_utc is None:
         return None
 
-    return created_at_utc + timedelta(seconds=EXPIRATION_SECONDS)
+    return created_at_utc + timedelta(
+        seconds=EXPIRATION_SECONDS
+    )
 
 
 def order_is_expired(order: Order) -> bool:
@@ -116,31 +143,64 @@ def order_is_expired(order: Order) -> bool:
     return utc_now() >= deadline
 
 
-def fail_expired_order(db: Session, order: Order) -> None:
-    """
-    Membatalkan pesanan yang sudah melewati tenggat.
+# ============================================================
+# ORDER EXPIRATION
+# ============================================================
 
-    Stok tidak dikurangi atau ditambah karena stok
-    belum dikurangi ketika pesanan dibuat.
+def fail_expired_order(
+    db: Session,
+    order: Order,
+) -> bool:
     """
-    if order.status == "pending":
-        order.status = "cancelled"
+    Membatalkan pesanan pending yang sudah kedaluwarsa.
 
+    Stok dikembalikan hanya jika stock_reserved=True.
+    Flag diubah menjadi False agar stok tidak dikembalikan
+    lebih dari satu kali.
+
+    Pemanggil bertanggung jawab melakukan commit.
+    """
+    if order.status != "pending":
+        return False
+
+    if not order_is_expired(order):
+        return False
+
+    # Kembalikan stok hanya jika pesanan masih memiliki reservasi.
+    if getattr(order, "stock_reserved", False):
+        restore_order_stock(db, order)
+        order.stock_reserved = False
+
+    order.status = "cancelled"
+
+    # Tandai pembayaran pending sebagai gagal.
     payments = db.scalars(
         select(Payment)
-        .where(Payment.order_id == order.id)
+        .where(
+            Payment.order_id == order.id,
+            Payment.payment_status == "pending",
+        )
         .with_for_update()
     ).all()
 
     for payment in payments:
-        if payment.payment_status == "pending":
-            payment.payment_status = "failed"
+        payment.payment_status = "failed"
 
+    return True
+
+
+# ============================================================
+# DATABASE HELPERS
+# ============================================================
 
 def get_order_for_update(
     db: Session,
     order_id: int,
 ) -> Order | None:
+    """
+    Mengunci pesanan selama transaksi untuk mengurangi
+    risiko dua proses mengubah pesanan secara bersamaan.
+    """
     return db.scalar(
         select(Order)
         .where(Order.id == order_id)
@@ -159,6 +219,10 @@ def get_payment_for_update(
     )
 
 
+# ============================================================
+# CREATE PAYMENT
+# ============================================================
+
 @router.post(
     "/",
     response_model=PaymentResponse,
@@ -167,24 +231,23 @@ def get_payment_for_update(
 def create_payment(
     payload: PaymentCreate,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """
-    Membuat pembayaran untuk pesanan yang masih pending.
+    Membuat pembayaran untuk pesanan pending.
 
-    Membuat pembayaran tidak mengurangi stok tiket.
+    Penting:
+    Endpoint ini tidak mengurangi stok.
+    Stok sudah direservasi ketika pesanan dibuat.
     """
     try:
-        order = db.scalar(
-            select(Order)
-            .where(
-                Order.id == payload.order_id,
-                Order.user_id == current_user.id,
-            )
-            .with_for_update()
+        # Kunci pesanan sebelum memeriksa status dan pembayaran.
+        order = get_order_for_update(
+            db,
+            payload.order_id,
         )
 
-        if order is None:
+        if order is None or order.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pesanan tidak ditemukan.",
@@ -199,17 +262,21 @@ def create_payment(
                 ),
             )
 
+        # Periksa apakah pesanan sudah kedaluwarsa.
         if order_is_expired(order):
             fail_expired_order(db, order)
             db.commit()
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Waktu pembayaran habis. Pesanan telah dibatalkan.",
+                detail=(
+                    "Waktu pembayaran habis. "
+                    "Pesanan telah dibatalkan."
+                ),
             )
 
-        # Jika sudah ada pembayaran pending untuk pesanan ini,
-        # gunakan pembayaran tersebut agar tidak membuat duplikat.
+        # Hindari membuat pembayaran pending berulang kali
+        # untuk pesanan yang sama.
         existing_payment = db.scalar(
             select(Payment)
             .where(
@@ -240,36 +307,53 @@ def create_payment(
         db.rollback()
         raise
 
-    except Exception:
+    except SQLAlchemyError:
         db.rollback()
+        logger.exception(
+            "Database error saat membuat pembayaran."
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Gagal membuat pembayaran.",
         )
 
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Kesalahan tidak terduga saat membuat pembayaran."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat membuat pembayaran.",
+        )
+
+
+# ============================================================
+# CONFIRM PAYMENT
+# ============================================================
 
 @router.post("/{payment_id}/confirm")
 def confirm_payment(
     payment_id: int,
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Mengonfirmasi pembayaran simulasi.
 
-    Stok dikurangi hanya jika:
-    - Pembayaran masih pending.
-    - Pesanan masih pending.
-    - Pesanan belum kedaluwarsa.
-    - Stok tiket masih mencukupi.
+    Jika pembayaran berhasil:
+    - payment_status menjadi success;
+    - paid_at diisi;
+    - status pesanan menjadi paid;
+    - stok TIDAK dikurangi lagi.
 
-    Pembayaran yang sudah success tidak memproses stok lagi.
+    Pengurangan stok sudah dilakukan saat order dibuat.
     """
     try:
-        # Ambil pembayaran untuk mengetahui order_id.
-        initial_payment = db.scalar(
-            select(Payment).where(Payment.id == payment_id)
-        )
+        # Cari pembayaran terlebih dahulu untuk mengetahui order_id.
+        initial_payment = db.get(Payment, payment_id)
 
         if initial_payment is None:
             raise HTTPException(
@@ -277,12 +361,11 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan.",
             )
 
-        # Kunci pesanan terlebih dahulu agar konfirmasi yang
-        # bersamaan untuk satu pesanan tidak memproses stok ganda.
-        order = db.scalar(
-            select(Order)
-            .where(Order.id == initial_payment.order_id)
-            .with_for_update()
+        # Kunci pesanan terlebih dahulu agar konfirmasi bersamaan
+        # untuk pesanan yang sama tidak memprosesnya dua kali.
+        order = get_order_for_update(
+            db,
+            initial_payment.order_id,
         )
 
         if order is None:
@@ -297,10 +380,10 @@ def confirm_payment(
                 detail="Anda tidak memiliki akses ke pembayaran ini.",
             )
 
-        payment = db.scalar(
-            select(Payment)
-            .where(Payment.id == payment_id)
-            .with_for_update()
+        # Setelah order terkunci, kunci pembayaran.
+        payment = get_payment_for_update(
+            db,
+            payment_id,
         )
 
         if payment is None:
@@ -309,7 +392,7 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan.",
             )
 
-        # Jika pembayaran sudah sukses, jangan kurangi stok lagi.
+        # Konfirmasi berulang tidak boleh memproses ulang pembayaran.
         if payment.payment_status == "success":
             return {
                 "message": "Pembayaran sudah berhasil.",
@@ -337,103 +420,34 @@ def confirm_payment(
                 ),
             )
 
-        # Pastikan tenggat belum terlewati.
+        # Jika sudah kedaluwarsa, batalkan pesanan dan
+        # kembalikan reservasi stok dalam transaksi yang sama.
         if order_is_expired(order):
             fail_expired_order(db, order)
             db.commit()
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Waktu pembayaran habis. Pesanan telah dibatalkan.",
+                detail=(
+                    "Waktu pembayaran habis. "
+                    "Pesanan telah dibatalkan."
+                ),
             )
 
-        # Kunci event terkait.
-        event = db.scalar(
-            select(Event)
-            .where(Event.id == order.event_id)
-            .with_for_update()
-        )
-
-        if event is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan.",
-            )
-
-        # Kurangi stok pada TicketClass jika pesanan menggunakan
-        # kelas tiket. Jika tidak, gunakan stok pada Event.
-        ticket_class_id = getattr(order, "ticket_class_id", None)
-        quantity = int(order.quantity)
-
-        if quantity <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Jumlah tiket pada pesanan tidak valid.",
-            )
-
-        if ticket_class_id is not None:
-            ticket_class = db.scalar(
-                select(TicketClass)
-                .where(
-                    TicketClass.id == ticket_class_id,
-                    TicketClass.event_id == event.id,
-                )
-                .with_for_update()
-            )
-
-            if ticket_class is None:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail="Kelas tiket tidak ditemukan.",
-                )
-
-            # Update bersyarat mencegah stok menjadi negatif.
-            result = db.execute(
-                update(TicketClass)
-                .where(
-                    TicketClass.id == ticket_class.id,
-                    TicketClass.available_tickets >= quantity,
-                )
-                .values(
-                    available_tickets=(
-                        TicketClass.available_tickets - quantity
-                    )
-                )
-            )
-
-            if result.rowcount != 1:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Stok tiket tidak mencukupi.",
-                )
-
-        else:
-            # Kompatibilitas dengan model lama yang menyimpan
-            # stok langsung pada Event.
-            result = db.execute(
-                update(Event)
-                .where(
-                    Event.id == event.id,
-                    Event.available_tickets >= quantity,
-                )
-                .values(
-                    available_tickets=(
-                        Event.available_tickets - quantity
-                    )
-                )
-            )
-
-            if result.rowcount != 1:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Stok tiket tidak mencukupi.",
-                )
-
-        # Update status pembayaran dan pesanan dalam transaksi
-        # yang sama dengan pengurangan stok.
+        # Tidak ada pengurangan stok di endpoint ini.
+        # Stok sudah dikurangi ketika pesanan dibuat.
+        #
+        # Perubahan status pembayaran dan pesanan disimpan
+        # dalam satu transaksi.
         payment.payment_status = "success"
         payment.paid_at = utc_now()
         order.status = "paid"
+
+        # Pesanan yang berhasil dibayar tidak lagi memegang
+        # reservasi untuk dikembalikan saat kedaluwarsa.
+        #
+        # Stoknya tetap terpakai karena tiket telah terjual.
+        order.stock_reserved = False
 
         db.commit()
 
@@ -452,44 +466,87 @@ def confirm_payment(
         db.rollback()
         raise
 
-    except Exception:
+    except SQLAlchemyError:
         db.rollback()
+        logger.exception(
+            "Database error saat mengonfirmasi pembayaran."
+        )
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Gagal mengonfirmasi pembayaran.",
         )
 
+    except Exception:
+        db.rollback()
+        logger.exception(
+            "Kesalahan tidak terduga saat mengonfirmasi pembayaran."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat mengonfirmasi pembayaran.",
+        )
+
+
+# ============================================================
+# GET MY PAYMENTS
+# ============================================================
 
 @router.get("/my")
 def get_my_payments(
     db: Session = Depends(get_db),
-    current_user=Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ):
     """
     Mengambil daftar pembayaran milik pengguna yang login.
     """
-    payments = db.scalars(
-        select(Payment)
-        .join(Order, Payment.order_id == Order.id)
-        .where(Order.user_id == current_user.id)
-        .order_by(Payment.id.desc())
-    ).all()
+    try:
+        payments = db.scalars(
+            select(Payment)
+            .join(
+                Order,
+                Payment.order_id == Order.id,
+            )
+            .where(
+                Order.user_id == current_user.id,
+            )
+            .order_by(Payment.id.desc())
+        ).all()
 
-    return [
-        {
-            "id": payment.id,
-            "order_id": payment.order_id,
-            "payment_method": payment.payment_method,
-            "payment_provider": payment.payment_provider,
-            "amount": payment.amount,
-            "payment_status": payment.payment_status,
-            "transaction_id": getattr(
-                payment,
-                "transaction_id",
-                None,
-            ),
-            "created_at": getattr(payment, "created_at", None),
-            "paid_at": getattr(payment, "paid_at", None),
-        }
-        for payment in payments
-    ]
+        return [
+            {
+                "id": payment.id,
+                "order_id": payment.order_id,
+                "payment_method": payment.payment_method,
+                "payment_provider": payment.payment_provider,
+                "amount": payment.amount,
+                "payment_status": payment.payment_status,
+                "transaction_id": getattr(
+                    payment,
+                    "transaction_id",
+                    None,
+                ),
+                "created_at": getattr(
+                    payment,
+                    "created_at",
+                    None,
+                ),
+                "paid_at": getattr(
+                    payment,
+                    "paid_at",
+                    None,
+                ),
+            }
+            for payment in payments
+        ]
+
+    except SQLAlchemyError:
+        logger.exception(
+            "Database error saat mengambil daftar pembayaran."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Daftar pembayaran gagal dimuat.",
+        )
