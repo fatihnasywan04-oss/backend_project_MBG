@@ -9,12 +9,15 @@ from sqlalchemy import (
     CheckConstraint,
     Boolean,
 )
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, synonym
 from sqlalchemy.sql import func
 
 from database import Base
 
 
+# =========================================================
+# USER
+# =========================================================
 class User(Base):
     __tablename__ = "users"
 
@@ -22,10 +25,8 @@ class User(Base):
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
 
-    # Sesuai dengan nama kolom di database Neon.
+    # Sesuai dengan kolom database Neon.
     password_hash = Column(String(255), nullable=False)
-
-    # Sesuai dengan kolom role di database Neon.
     role = Column(String(50), nullable=False, default="user")
 
     created_at = Column(
@@ -40,16 +41,30 @@ class User(Base):
     )
 
 
+# =========================================================
+# EVENT
+# =========================================================
 class Event(Base):
     __tablename__ = "events"
 
     id = Column(Integer, primary_key=True, index=True)
     title = Column(String(255), nullable=False)
-    description = Column(Text, nullable=True)
-    location = Column(String(255), nullable=True)
+    description = Column(Text, nullable=False)
+    location = Column(String(255), nullable=False)
+
+    # Nama kolom yang benar di database adalah event_date.
+    event_date = Column(DateTime(timezone=True), nullable=False)
+
+    price = Column(Numeric(12, 2), nullable=False)
+    available_tickets = Column(Integer, nullable=False)
+
     image_url = Column(String(500), nullable=True)
-    start_date = Column(DateTime(timezone=True), nullable=False)
-    end_date = Column(DateTime(timezone=True), nullable=True)
+
+    created_by = Column(
+        Integer,
+        ForeignKey("users.id"),
+        nullable=False,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -57,10 +72,20 @@ class Event(Base):
         nullable=False,
     )
 
+    is_cancelled = Column(
+        Boolean,
+        nullable=False,
+        default=False,
+        server_default="false",
+    )
+
+    # Kompatibilitas sementara untuk kode lama yang membaca
+    # event.start_date. Keduanya merujuk kolom event_date.
+    start_date = synonym("event_date")
+
     ticket_classes = relationship(
         "TicketClass",
         back_populates="event",
-        cascade="all, delete-orphan",
     )
 
     orders = relationship(
@@ -69,6 +94,9 @@ class Event(Base):
     )
 
 
+# =========================================================
+# TICKET CLASS
+# =========================================================
 class TicketClass(Base):
     __tablename__ = "ticket_classes"
 
@@ -83,7 +111,19 @@ class TicketClass(Base):
 
     name = Column(String(100), nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
-    stock = Column(Integer, nullable=False, default=0)
+
+    # Atribut Python tetap bernama stock agar kode order lama
+    # tetap bisa menggunakan ticket_class.stock.
+    # Nama kolom database yang sebenarnya adalah available_tickets.
+    stock = Column(
+        "available_tickets",
+        Integer,
+        nullable=False,
+        default=0,
+    )
+
+    # Alias untuk kode yang menggunakan ticket_class.available_tickets.
+    available_tickets = synonym("stock")
 
     __table_args__ = (
         CheckConstraint(
@@ -91,7 +131,7 @@ class TicketClass(Base):
             name="check_ticket_class_price_nonnegative",
         ),
         CheckConstraint(
-            "stock >= 0",
+            "available_tickets >= 0",
             name="check_ticket_class_stock_nonnegative",
         ),
     )
@@ -107,6 +147,9 @@ class TicketClass(Base):
     )
 
 
+# =========================================================
+# ORDER
+# =========================================================
 class Order(Base):
     __tablename__ = "orders"
 
@@ -135,9 +178,14 @@ class Order(Base):
 
     quantity = Column(Integer, nullable=False)
     total_price = Column(Numeric(12, 2), nullable=False)
-    status = Column(String(30), nullable=False, default="pending")
 
-    # Menandai apakah stok tiket sudah dikurangi untuk order ini.
+    status = Column(
+        String(30),
+        nullable=False,
+        default="pending",
+    )
+
+    # Menandai apakah stok sudah dikurangi saat order dibuat.
     stock_reserved = Column(
         Boolean,
         nullable=False,
@@ -189,6 +237,9 @@ class Order(Base):
     )
 
 
+# =========================================================
+# PAYMENT
+# =========================================================
 class Payment(Base):
     __tablename__ = "payments"
 
@@ -203,8 +254,18 @@ class Payment(Base):
 
     amount = Column(Numeric(12, 2), nullable=False)
     method = Column(String(50), nullable=True)
-    status = Column(String(30), nullable=False, default="pending")
-    transaction_id = Column(String(255), nullable=True, unique=True)
+
+    status = Column(
+        String(30),
+        nullable=False,
+        default="pending",
+    )
+
+    transaction_id = Column(
+        String(255),
+        nullable=True,
+        unique=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
