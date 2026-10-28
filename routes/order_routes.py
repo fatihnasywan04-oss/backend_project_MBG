@@ -14,9 +14,10 @@ from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
+
 logger = logging.getLogger(__name__)
 
-# Batas pembayaran: 60 detik
+# Harus sama dengan batas pembayaran di payment_routes.py.
 EXPIRATION_SECONDS = 60
 
 
@@ -56,8 +57,6 @@ class PaymentDetailResponse(BaseModel):
     transaction_id: str | None = None
     paid_at: datetime | None = None
 
-    model_config = ConfigDict(from_attributes=True)
-
 
 class OrderDetailResponse(OrderHistoryResponse):
     payment: PaymentDetailResponse | None = None
@@ -87,35 +86,44 @@ def require_admin(current_user: User) -> None:
 # TIME / EXPIRATION
 # ============================================================
 
-def as_utc(value: datetime) -> datetime:
-    """
-    Normalisasi datetime ke UTC.
-    Database lama mungkin mengembalikan datetime tanpa timezone.
-    """
+def as_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
 
     return value.astimezone(timezone.utc)
 
 
-def order_deadline(order: Order) -> datetime:
-    """
-    Mengambil batas waktu pembayaran.
+def order_deadline(order: Order) -> datetime | None:
+    expires_at = getattr(order, "expires_at", None)
 
-    Order baru menggunakan expires_at.
-    Order lama yang belum memiliki expires_at menggunakan
-    created_at + EXPIRATION_SECONDS.
-    """
-    if order.expires_at is not None:
-        return as_utc(order.expires_at)
+    if expires_at is not None:
+        return as_utc(expires_at)
 
-    return as_utc(order.created_at) + timedelta(
+    created_at = getattr(order, "created_at", None)
+
+    if created_at is None:
+        return None
+
+    created_at_utc = as_utc(created_at)
+
+    if created_at_utc is None:
+        return None
+
+    return created_at_utc + timedelta(
         seconds=EXPIRATION_SECONDS
     )
 
 
 def is_expired(order: Order) -> bool:
-    return datetime.now(timezone.utc) >= order_deadline(order)
+    deadline = order_deadline(order)
+
+    if deadline is None:
+        return False
+
+    return datetime.now(timezone.utc) >= deadline
 
 
 def expire_order_if_needed(
@@ -123,11 +131,10 @@ def expire_order_if_needed(
     order: Order,
 ) -> bool:
     """
-    Membatalkan order pending yang sudah melewati batas waktu.
+    Batalkan order pending yang telah kedaluwarsa.
 
-    Order yang sudah paid atau cancelled tidak diubah.
-    Stok dikembalikan hanya jika order ini sebelumnya sudah
-    melakukan reservasi stok.
+    Stok dikembalikan hanya jika stock_reserved=True.
+    Pemanggil bertanggung jawab melakukan commit.
     """
     if order.status != "pending":
         return False
@@ -135,45 +142,66 @@ def expire_order_if_needed(
     if not is_expired(order):
         return False
 
-    order.status = "cancelled"
-
-    # Kembalikan stok hanya jika sebelumnya sudah direservasi.
+    # Kembalikan stok sebelum mengubah flag reservasi.
     if getattr(order, "stock_reserved", False):
         restore_order_stock(db, order)
         order.stock_reserved = False
 
-    # Tandai pembayaran yang masih pending sebagai gagal.
+    order.status = "cancelled"
+
     payments = db.scalars(
         select(Payment)
         .where(
             Payment.order_id == order.id,
-            Payment.payment_status == "pending",
+            Payment.status == "pending",
         )
         .with_for_update()
     ).all()
 
     for payment in payments:
-        payment.payment_status = "failed"
+        payment.status = "failed"
 
     return True
 
 
 # ============================================================
-# RESPONSE HELPER
+# RESPONSE HELPERS
 # ============================================================
 
 def order_to_dict(order: Order) -> dict:
+    event = getattr(order, "event", None)
+
     return {
         "id": order.id,
         "user_id": order.user_id,
         "event_id": order.event_id,
         "ticket_class_id": order.ticket_class_id,
-        "event_title": order.event.title,
+        "event_title": (
+            event.title if event is not None else "Event tidak tersedia"
+        ),
         "quantity": order.quantity,
         "total_price": order.total_price,
         "status": order.status,
         "created_at": order.created_at,
         "expires_at": order_deadline(order),
+    }
+
+
+def payment_to_dict(payment: Payment | None) -> dict | None:
+    if payment is None:
+        return None
+
+    return {
+        "id": payment.id,
+        "amount": payment.amount,
+        "payment_method": getattr(payment, "method", None),
+        "payment_status": payment.status,
+        "transaction_id": getattr(payment, "transaction_id", None),
+
+        # Model Payment yang diketahui tidak mempunyai paid_at.
+        # Jangan mengklaim updated_at sebagai waktu pembayaran
+        # jika model tidak menyimpan waktu pembayaran secara khusus.
+        "paid_at": None,
     }
 
 
@@ -194,7 +222,6 @@ def create_order(
     require_user(current_user)
 
     try:
-        # Kunci event untuk mengurangi risiko transaksi bersamaan.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -213,7 +240,12 @@ def create_order(
                 detail="Event sudah dibatalkan dan tidak dapat dipesan",
             )
 
-        if as_utc(event.event_date) <= datetime.now(timezone.utc):
+        event_date = as_utc(event.event_date)
+
+        if (
+            event_date is not None
+            and event_date <= datetime.now(timezone.utc)
+        ):
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Event sudah berlangsung",
@@ -221,7 +253,6 @@ def create_order(
 
         ticket_class = None
 
-        # Jika user memilih kelas tiket.
         if data.ticket_class_id is not None:
             ticket_class = db.scalar(
                 select(TicketClass)
@@ -250,7 +281,6 @@ def create_order(
             unit_price = Decimal(str(ticket_class.price))
 
         else:
-            # Kompatibilitas dengan pemesanan event lama tanpa kelas.
             if event.available_tickets < data.quantity:
                 raise HTTPException(
                     status_code=status.HTTP_400_BAD_REQUEST,
@@ -268,7 +298,9 @@ def create_order(
             user_id=current_user.id,
             event_id=event.id,
             ticket_class_id=(
-                ticket_class.id if ticket_class is not None else None
+                ticket_class.id
+                if ticket_class is not None
+                else None
             ),
             quantity=data.quantity,
             total_price=unit_price * data.quantity,
@@ -279,8 +311,7 @@ def create_order(
             stock_reserved=True,
         )
 
-        # Reservasi stok dilakukan saat order dibuat.
-        # Perubahan stok dan pembuatan order berada dalam satu transaksi.
+        # Reservasi stok hanya dilakukan di sini.
         if ticket_class is not None:
             ticket_class.available_tickets -= data.quantity
         else:
@@ -303,6 +334,15 @@ def create_order(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pesanan gagal disimpan. Silakan coba lagi.",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membuat pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat membuat pesanan.",
         )
 
 
@@ -338,10 +378,15 @@ def get_my_orders(
         if changed:
             db.commit()
 
+        # Kembalikan seluruh status, bukan hanya pesanan paid.
         return [
             order_to_dict(order)
             for order in orders
         ]
+
+    except HTTPException:
+        db.rollback()
+        raise
 
     except SQLAlchemyError:
         db.rollback()
@@ -350,6 +395,15 @@ def get_my_orders(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Riwayat pesanan gagal dimuat",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membaca riwayat pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat memuat riwayat pesanan",
         )
 
 
@@ -389,6 +443,10 @@ def get_all_orders_admin(
             for order in orders
         ]
 
+    except HTTPException:
+        db.rollback()
+        raise
+
     except SQLAlchemyError:
         db.rollback()
         logger.exception("Gagal mengambil seluruh pesanan")
@@ -396,6 +454,15 @@ def get_all_orders_admin(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Data pesanan gagal dimuat",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membaca seluruh pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat memuat data pesanan",
         )
 
 
@@ -444,19 +511,7 @@ def get_order_detail(
         )
 
         result = order_to_dict(order)
-
-        result["payment"] = (
-            {
-                "id": payment.id,
-                "amount": payment.amount,
-                "payment_method": payment.payment_method,
-                "payment_status": payment.payment_status,
-                "transaction_id": payment.transaction_id,
-                "paid_at": payment.paid_at,
-            }
-            if payment is not None
-            else None
-        )
+        result["payment"] = payment_to_dict(payment)
 
         return result
 
@@ -471,6 +526,15 @@ def get_order_detail(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Detail pesanan gagal dimuat",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membaca detail pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat memuat detail pesanan",
         )
 
 
@@ -505,6 +569,8 @@ def cancel_order(
         if expire_order_if_needed(db, order):
             db.commit()
 
+            # Perubahan status kedaluwarsa sudah disimpan.
+            # Jangan rollback perubahan yang telah berhasil disimpan.
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Waktu pembayaran habis. Pesanan telah kedaluwarsa.",
@@ -516,24 +582,23 @@ def cancel_order(
                 detail="Hanya pesanan pending yang dapat dibatalkan",
             )
 
-        order.status = "cancelled"
-
         payments = db.scalars(
             select(Payment)
             .where(
                 Payment.order_id == order.id,
-                Payment.payment_status == "pending",
+                Payment.status == "pending",
             )
             .with_for_update()
         ).all()
 
         for payment in payments:
-            payment.payment_status = "failed"
+            payment.status = "failed"
 
-        # Kembalikan stok hanya jika order masih memegang reservasi.
         if getattr(order, "stock_reserved", False):
             restore_order_stock(db, order)
             order.stock_reserved = False
+
+        order.status = "cancelled"
 
         db.commit()
 
@@ -544,6 +609,8 @@ def cancel_order(
         }
 
     except HTTPException:
+        # Jika transaksi kedaluwarsa sudah di-commit, rollback ini
+        # tidak akan membatalkan perubahan yang sudah tersimpan.
         db.rollback()
         raise
 
@@ -554,4 +621,13 @@ def cancel_order(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Pesanan gagal dibatalkan",
+        )
+
+    except Exception:
+        db.rollback()
+        logger.exception("Kesalahan saat membatalkan pesanan")
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat membatalkan pesanan",
         )
