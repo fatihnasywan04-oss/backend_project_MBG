@@ -9,7 +9,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Event, Order, Payment, TicketClass
 from routes.auth_routes import get_current_user
-
+from order_stock import restore_order_stock
 
 router = APIRouter(
     prefix="/payments",

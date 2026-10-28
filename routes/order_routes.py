@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, joinedload
 from database import get_db
 from models import Event, Order, Payment, TicketClass, User
 from routes.auth_routes import get_current_user
-
+from order_stock import restore_order_stock
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
