@@ -14,14 +14,9 @@ from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
 
 
-router = APIRouter(
-    prefix="/orders",
-    tags=["Orders"],
-)
-
+router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
 
-# Harus sama dengan EXPIRATION_SECONDS di payment_routes.py.
 EXPIRATION_SECONDS = 60
 
 
@@ -110,24 +105,16 @@ def order_deadline(order: Order) -> datetime | None:
     if expires_at is not None:
         return as_utc(expires_at)
 
-    created_at = getattr(order, "created_at", None)
+    created_at = as_utc(getattr(order, "created_at", None))
 
     if created_at is None:
         return None
 
-    created_at = as_utc(created_at)
-
-    if created_at is None:
-        return None
-
-    return created_at + timedelta(
-        seconds=EXPIRATION_SECONDS
-    )
+    return created_at + timedelta(seconds=EXPIRATION_SECONDS)
 
 
 def is_expired(order: Order) -> bool:
     deadline = order_deadline(order)
-
     return deadline is not None and utc_now() >= deadline
 
 
@@ -136,7 +123,7 @@ def expire_order_if_needed(
     order: Order,
 ) -> bool:
     """
-    Membatalkan pesanan pending yang sudah kedaluwarsa.
+    Batalkan pesanan pending yang kedaluwarsa.
 
     Stok dikembalikan hanya jika stock_reserved=True.
     Pemanggil bertanggung jawab melakukan commit.
@@ -150,7 +137,7 @@ def expire_order_if_needed(
 
     order.status = "cancelled"
 
-    pending_payments = db.scalars(
+    payments = db.scalars(
         select(Payment)
         .where(
             Payment.order_id == order.id,
@@ -159,7 +146,7 @@ def expire_order_if_needed(
         .with_for_update()
     ).all()
 
-    for payment in pending_payments:
+    for payment in payments:
         payment.status = "failed"
 
     return True
@@ -198,8 +185,7 @@ def payment_to_dict(payment: Payment | None) -> dict | None:
         "payment_method": payment.method,
         "payment_status": payment.status,
         "transaction_id": payment.transaction_id,
-        # Model Payment saat ini tidak memiliki kolom paid_at.
-        "paid_at": None,
+        "paid_at": payment.paid_at,
     }
 
 
@@ -220,8 +206,6 @@ def create_order(
     require_user(current_user)
 
     try:
-        # Kunci event untuk menghindari reservasi stok bersamaan
-        # pada event yang sama.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -248,8 +232,6 @@ def create_order(
                 detail="Event sudah berlangsung.",
             )
 
-        # Kelas tiket wajib dipilih karena Order.ticket_class_id
-        # pada model database tidak mengizinkan NULL.
         ticket_class = db.scalar(
             select(TicketClass)
             .where(
@@ -274,8 +256,7 @@ def create_order(
                 ),
             )
 
-        unit_price = Decimal(str(ticket_class.price))
-        total_price = unit_price * data.quantity
+        total_price = Decimal(str(ticket_class.price)) * data.quantity
 
         order = Order(
             user_id=current_user.id,
@@ -290,7 +271,6 @@ def create_order(
             stock_reserved=True,
         )
 
-        # Reservasi stok dilakukan saat pesanan dibuat.
         ticket_class.available_tickets -= data.quantity
 
         db.add(order)
@@ -306,10 +286,7 @@ def create_order(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat membuat pesanan."
-        )
+        logger.exception("Database error saat membuat pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -318,10 +295,7 @@ def create_order(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan tidak terduga saat membuat pesanan."
-        )
+        logger.exception("Kesalahan saat membuat pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -361,10 +335,7 @@ def get_my_orders(
         if changed:
             db.commit()
 
-        return [
-            order_to_dict(order)
-            for order in orders
-        ]
+        return [order_to_dict(order) for order in orders]
 
     except HTTPException:
         db.rollback()
@@ -372,10 +343,7 @@ def get_my_orders(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat mengambil riwayat pesanan."
-        )
+        logger.exception("Database error saat mengambil riwayat pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -384,10 +352,7 @@ def get_my_orders(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan saat membaca riwayat pesanan."
-        )
+        logger.exception("Kesalahan saat membaca riwayat pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -426,10 +391,7 @@ def get_all_orders_admin(
         if changed:
             db.commit()
 
-        return [
-            order_to_dict(order)
-            for order in orders
-        ]
+        return [order_to_dict(order) for order in orders]
 
     except HTTPException:
         db.rollback()
@@ -437,10 +399,7 @@ def get_all_orders_admin(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat mengambil semua pesanan."
-        )
+        logger.exception("Database error saat mengambil semua pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -449,10 +408,7 @@ def get_all_orders_admin(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan saat membaca semua pesanan."
-        )
+        logger.exception("Kesalahan saat membaca semua pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -513,10 +469,7 @@ def get_order_detail(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat mengambil detail pesanan."
-        )
+        logger.exception("Database error saat mengambil detail pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -525,10 +478,7 @@ def get_order_detail(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan saat membaca detail pesanan."
-        )
+        logger.exception("Kesalahan saat membaca detail pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -602,10 +552,7 @@ def cancel_order(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat membatalkan pesanan."
-        )
+        logger.exception("Database error saat membatalkan pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -614,10 +561,7 @@ def cancel_order(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan saat membatalkan pesanan."
-        )
+        logger.exception("Kesalahan saat membatalkan pesanan.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,

@@ -24,8 +24,6 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
-
-    # Sesuai dengan kolom database Neon.
     password_hash = Column(String(255), nullable=False)
     role = Column(String(50), nullable=False, default="user")
 
@@ -51,13 +49,9 @@ class Event(Base):
     title = Column(String(255), nullable=False)
     description = Column(Text, nullable=False)
     location = Column(String(255), nullable=False)
-
-    # Nama kolom yang benar di database adalah event_date.
     event_date = Column(DateTime(timezone=True), nullable=False)
-
     price = Column(Numeric(12, 2), nullable=False)
     available_tickets = Column(Integer, nullable=False)
-
     image_url = Column(String(500), nullable=True)
 
     created_by = Column(
@@ -79,8 +73,7 @@ class Event(Base):
         server_default="false",
     )
 
-    # Kompatibilitas sementara untuk kode lama yang membaca
-    # event.start_date. Keduanya merujuk kolom event_date.
+    # Alias untuk kompatibilitas dengan kode yang memakai start_date.
     start_date = synonym("event_date")
 
     ticket_classes = relationship(
@@ -112,9 +105,7 @@ class TicketClass(Base):
     name = Column(String(100), nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
 
-    # Atribut Python tetap bernama stock agar kode order lama
-    # tetap bisa menggunakan ticket_class.stock.
-    # Nama kolom database yang sebenarnya adalah available_tickets.
+    # Atribut Python stock dipetakan ke kolom database available_tickets.
     stock = Column(
         "available_tickets",
         Integer,
@@ -122,7 +113,7 @@ class TicketClass(Base):
         default=0,
     )
 
-    # Alias untuk kode yang menggunakan ticket_class.available_tickets.
+    # Alias untuk kode yang memakai available_tickets.
     available_tickets = synonym("stock")
 
     __table_args__ = (
@@ -185,7 +176,6 @@ class Order(Base):
         default="pending",
     )
 
-    # Menandai apakah stok sudah dikurangi saat order dibuat.
     stock_reserved = Column(
         Boolean,
         nullable=False,
@@ -253,9 +243,19 @@ class Payment(Base):
     )
 
     amount = Column(Numeric(12, 2), nullable=False)
-    method = Column(String(50), nullable=True)
 
+    # Nama kolom database: payment_method.
+    # Atribut Python method dipertahankan agar route lama tetap kompatibel.
+    method = Column(
+        "payment_method",
+        String(50),
+        nullable=True,
+    )
+
+    # Nama kolom database: payment_status.
+    # Atribut Python status dipertahankan agar route lama tetap kompatibel.
     status = Column(
+        "payment_status",
         String(30),
         nullable=False,
         default="pending",
@@ -273,11 +273,21 @@ class Payment(Base):
         nullable=False,
     )
 
-    updated_at = Column(
+    # Database memiliki paid_at, bukan updated_at.
+    paid_at = Column(
         DateTime(timezone=True),
-        onupdate=func.now(),
         nullable=True,
     )
+
+    # Kolom ini tersedia pada database Neon.
+    payment_provider = Column(
+        String(100),
+        nullable=True,
+    )
+
+    # Alias untuk kode yang memakai nama kolom database secara langsung.
+    payment_method = synonym("method")
+    payment_status = synonym("status")
 
     __table_args__ = (
         CheckConstraint(

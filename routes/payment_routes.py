@@ -14,14 +14,9 @@ from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
 
 
-router = APIRouter(
-    prefix="/payments",
-    tags=["Payments"],
-)
-
+router = APIRouter(prefix="/payments", tags=["Payments"])
 logger = logging.getLogger(__name__)
 
-# Harus sama dengan routes/order_routes.py.
 EXPIRATION_SECONDS = 60
 
 
@@ -111,12 +106,7 @@ def order_deadline(order: Order) -> datetime | None:
     if expires_at is not None:
         return as_utc(expires_at)
 
-    created_at = getattr(order, "created_at", None)
-
-    if created_at is None:
-        return None
-
-    created_at = as_utc(created_at)
+    created_at = as_utc(getattr(order, "created_at", None))
 
     if created_at is None:
         return None
@@ -136,31 +126,17 @@ def order_is_expired(order: Order) -> bool:
 # RESPONSE HELPER
 # ============================================================
 
-def payment_to_response(
-    payment: Payment,
-    payment_provider: str | None = None,
-) -> dict:
-    """
-    Model Payment menggunakan:
-    - method
-    - status
-    - transaction_id
-    - created_at
-    - updated_at
-
-    payment_provider dan paid_at belum memiliki kolom
-    tersendiri di model yang digunakan saat ini.
-    """
+def payment_to_response(payment: Payment) -> dict:
     return {
         "id": payment.id,
         "order_id": payment.order_id,
         "payment_method": payment.method,
-        "payment_provider": payment_provider,
+        "payment_provider": payment.payment_provider,
         "amount": float(payment.amount),
         "payment_status": payment.status,
         "transaction_id": payment.transaction_id,
         "created_at": payment.created_at,
-        "paid_at": None,
+        "paid_at": payment.paid_at,
     }
 
 
@@ -174,14 +150,10 @@ def fail_expired_order(
 ) -> bool:
     """
     Batalkan pesanan pending yang kedaluwarsa.
-
-    Stok hanya dikembalikan apabila stock_reserved=True.
+    Stok dikembalikan hanya jika stock_reserved=True.
     Pemanggil bertanggung jawab melakukan commit.
     """
-    if order.status != "pending":
-        return False
-
-    if not order_is_expired(order):
+    if order.status != "pending" or not order_is_expired(order):
         return False
 
     if getattr(order, "stock_reserved", False):
@@ -273,8 +245,7 @@ def create_payment(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Waktu pembayaran habis. "
-                    "Pesanan telah dibatalkan. "
+                    "Waktu pembayaran habis. Pesanan dibatalkan. "
                     "Silakan pesan tiket kembali."
                 ),
             )
@@ -289,33 +260,29 @@ def create_payment(
         )
 
         if existing_payment is not None:
-            result = payment_to_response(
-                existing_payment,
-                payload.payment_provider,
-            )
+            existing_payment.method = payload.payment_method
+            existing_payment.payment_provider = payload.payment_provider
 
+            db.flush()
             db.commit()
-            return result
+            db.refresh(existing_payment)
+
+            return payment_to_response(existing_payment)
 
         payment = Payment(
             order_id=order.id,
             method=payload.payment_method,
+            payment_provider=payload.payment_provider,
             amount=order.total_price,
             status="pending",
         )
 
         db.add(payment)
         db.flush()
-
-        result = payment_to_response(
-            payment,
-            payload.payment_provider,
-        )
-
         db.commit()
         db.refresh(payment)
 
-        return result
+        return payment_to_response(payment)
 
     except HTTPException:
         db.rollback()
@@ -323,10 +290,7 @@ def create_payment(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat membuat pembayaran."
-        )
+        logger.exception("Database error saat membuat pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -335,10 +299,7 @@ def create_payment(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan tidak terduga saat membuat pembayaran."
-        )
+        logger.exception("Kesalahan saat membuat pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -358,14 +319,10 @@ def confirm_payment(
 ):
     """
     Konfirmasi pembayaran simulasi.
-
     Endpoint ini bukan verifikasi dari payment gateway sungguhan.
     """
     try:
-        initial_payment = db.get(
-            Payment,
-            payment_id,
-        )
+        initial_payment = db.get(Payment, payment_id)
 
         if initial_payment is None:
             raise HTTPException(
@@ -373,7 +330,6 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan.",
             )
 
-        # Kunci pesanan sebelum mengunci pembayaran.
         order = get_order_for_update(
             db,
             initial_payment.order_id,
@@ -435,22 +391,20 @@ def confirm_payment(
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Waktu pembayaran habis. "
-                    "Pesanan telah dibatalkan."
-                ),
+                detail="Waktu pembayaran habis. Pesanan telah dibatalkan.",
             )
 
-        # Stok sudah direservasi saat order dibuat.
+        # Stok telah dikurangi ketika order dibuat.
         # Jangan kurangi stok untuk kedua kalinya.
         payment.status = "success"
+        payment.paid_at = utc_now()
+
         order.status = "paid"
 
-        # Reservasi selesai, tetapi stok tetap terpakai.
+        # Stok tetap terpakai setelah pembayaran berhasil.
         order.stock_reserved = False
 
         db.commit()
-
         db.refresh(payment)
         db.refresh(order)
 
@@ -468,10 +422,7 @@ def confirm_payment(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat mengonfirmasi pembayaran."
-        )
+        logger.exception("Database error saat mengonfirmasi pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -480,10 +431,7 @@ def confirm_payment(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan tidak terduga saat mengonfirmasi pembayaran."
-        )
+        logger.exception("Kesalahan saat mengonfirmasi pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -516,8 +464,6 @@ def get_my_payments(
             .order_by(Payment.id.desc())
         ).all()
 
-        # Provider tidak dapat dipulihkan dari database karena
-        # model Payment belum memiliki kolom payment_provider.
         return [
             payment_to_response(payment)
             for payment in payments
@@ -525,10 +471,7 @@ def get_my_payments(
 
     except SQLAlchemyError:
         db.rollback()
-
-        logger.exception(
-            "Database error saat mengambil daftar pembayaran."
-        )
+        logger.exception("Database error saat mengambil daftar pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -537,10 +480,7 @@ def get_my_payments(
 
     except Exception:
         db.rollback()
-
-        logger.exception(
-            "Kesalahan saat mengambil daftar pembayaran."
-        )
+        logger.exception("Kesalahan saat mengambil daftar pembayaran.")
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
