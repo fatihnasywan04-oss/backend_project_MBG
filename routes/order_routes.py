@@ -16,7 +16,7 @@ from order_stock import restore_order_stock
 router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
 
-# Batas pembayaran: 30 detik
+# Batas pembayaran: 60 detik
 EXPIRATION_SECONDS = 60
 
 
@@ -104,7 +104,7 @@ def order_deadline(order: Order) -> datetime:
 
     Order baru menggunakan expires_at.
     Order lama yang belum memiliki expires_at menggunakan
-    created_at + 30 detik.
+    created_at + EXPIRATION_SECONDS.
     """
     if order.expires_at is not None:
         return as_utc(order.expires_at)
@@ -126,9 +126,8 @@ def expire_order_if_needed(
     Membatalkan order pending yang sudah melewati batas waktu.
 
     Order yang sudah paid atau cancelled tidak diubah.
-
-    Stok tidak perlu dikembalikan karena stok baru dikurangi
-    saat pembayaran berhasil dikonfirmasi.
+    Stok dikembalikan hanya jika order ini sebelumnya sudah
+    melakukan reservasi stok.
     """
     if order.status != "pending":
         return False
@@ -138,6 +137,12 @@ def expire_order_if_needed(
 
     order.status = "cancelled"
 
+    # Kembalikan stok hanya jika sebelumnya sudah direservasi.
+    if getattr(order, "stock_reserved", False):
+        restore_order_stock(db, order)
+        order.stock_reserved = False
+
+    # Tandai pembayaran yang masih pending sebagai gagal.
     payments = db.scalars(
         select(Payment)
         .where(
@@ -271,10 +276,16 @@ def create_order(
             expires_at=now + timedelta(
                 seconds=EXPIRATION_SECONDS
             ),
+            stock_reserved=True,
         )
 
-        # Stok tidak dikurangi saat order dibuat.
-        # Stok hanya dikurangi ketika pembayaran berhasil.
+        # Reservasi stok dilakukan saat order dibuat.
+        # Perubahan stok dan pembuatan order berada dalam satu transaksi.
+        if ticket_class is not None:
+            ticket_class.available_tickets -= data.quantity
+        else:
+            event.available_tickets -= data.quantity
+
         db.add(order)
         db.commit()
         db.refresh(order)
@@ -519,7 +530,11 @@ def cancel_order(
         for payment in payments:
             payment.payment_status = "failed"
 
-        # Stok tidak dikembalikan karena belum dikurangi.
+        # Kembalikan stok hanya jika order masih memegang reservasi.
+        if getattr(order, "stock_reserved", False):
+            restore_order_stock(db, order)
+            order.stock_reserved = False
+
         db.commit()
 
         return {
