@@ -17,7 +17,7 @@ router = APIRouter(prefix="/orders", tags=["Orders"])
 logger = logging.getLogger(__name__)
 
 # Batas pembayaran: 30 detik
-EXPIRATION_SECONDS = 30
+EXPIRATION_SECONDS = 60
 
 
 # ============================================================

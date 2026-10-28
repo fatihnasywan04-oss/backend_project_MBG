@@ -17,7 +17,7 @@ router = APIRouter(
 )
 
 # Harus sama dengan batas waktu di routes/orders.py.
-EXPIRATION_SECONDS = 30
+EXPIRATION_SECONDS = 60
 
 
 class PaymentCreate(BaseModel):
