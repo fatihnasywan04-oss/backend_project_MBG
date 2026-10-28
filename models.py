@@ -7,7 +7,6 @@ from sqlalchemy import (
     Numeric,
     ForeignKey,
     CheckConstraint,
-    UniqueConstraint,
     Boolean,
 )
 from sqlalchemy.orm import relationship
@@ -22,7 +21,12 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(100), nullable=False)
     email = Column(String(255), unique=True, nullable=False, index=True)
-    password = Column(String(255), nullable=False)
+
+    # Sesuai dengan nama kolom di database Neon.
+    password_hash = Column(String(255), nullable=False)
+
+    # Sesuai dengan kolom role di database Neon.
+    role = Column(String(50), nullable=False, default="user")
 
     created_at = Column(
         DateTime(timezone=True),
@@ -69,12 +73,14 @@ class TicketClass(Base):
     __tablename__ = "ticket_classes"
 
     id = Column(Integer, primary_key=True, index=True)
+
     event_id = Column(
         Integer,
         ForeignKey("events.id", ondelete="CASCADE"),
         nullable=False,
         index=True,
     )
+
     name = Column(String(100), nullable=False)
     price = Column(Numeric(12, 2), nullable=False)
     stock = Column(Integer, nullable=False, default=0)
@@ -131,7 +137,7 @@ class Order(Base):
     total_price = Column(Numeric(12, 2), nullable=False)
     status = Column(String(30), nullable=False, default="pending")
 
-    # FIX: menandai apakah stok tiket sudah dikurangi untuk order ini.
+    # Menandai apakah stok tiket sudah dikurangi untuk order ini.
     stock_reserved = Column(
         Boolean,
         nullable=False,
