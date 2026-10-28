@@ -21,7 +21,7 @@ router = APIRouter(
 
 logger = logging.getLogger(__name__)
 
-# Samakan dengan order_routes.py.
+# Harus sama dengan routes/order_routes.py.
 EXPIRATION_SECONDS = 60
 
 
@@ -38,8 +38,6 @@ class PaymentCreate(BaseModel):
         "qris",
     ]
 
-    # Diterima dari Flutter, tetapi tidak disimpan karena
-    # model Payment yang diketahui tidak memiliki kolom provider.
     payment_provider: str = Field(
         min_length=1,
         max_length=100,
@@ -78,7 +76,7 @@ class PaymentCreate(BaseModel):
 class PaymentResponse(BaseModel):
     id: int
     order_id: int
-    payment_method: str
+    payment_method: str | None = None
     payment_provider: str | None = None
     amount: float
     payment_status: str
@@ -131,10 +129,7 @@ def order_deadline(order: Order) -> datetime | None:
 def order_is_expired(order: Order) -> bool:
     deadline = order_deadline(order)
 
-    return (
-        deadline is not None
-        and utc_now() >= deadline
-    )
+    return deadline is not None and utc_now() >= deadline
 
 
 # ============================================================
@@ -146,42 +141,31 @@ def payment_to_response(
     payment_provider: str | None = None,
 ) -> dict:
     """
-    Mengubah atribut model Payment menjadi format API.
+    Model Payment menggunakan:
+    - method
+    - status
+    - transaction_id
+    - created_at
+    - updated_at
 
-    Model yang diketahui menggunakan:
-    - method, bukan payment_method
-    - status, bukan payment_status
-    - updated_at, bukan paid_at
-
-    Provider tidak disimpan karena model yang diketahui
-    tidak memiliki kolom payment_provider.
+    payment_provider dan paid_at belum memiliki kolom
+    tersendiri di model yang digunakan saat ini.
     """
-    payment_status = payment.status
-
-    paid_at = None
-
-    if payment_status == "success":
-        paid_at = getattr(
-            payment,
-            "updated_at",
-            None,
-        )
-
     return {
         "id": payment.id,
         "order_id": payment.order_id,
         "payment_method": payment.method,
         "payment_provider": payment_provider,
         "amount": float(payment.amount),
-        "payment_status": payment_status,
+        "payment_status": payment.status,
         "transaction_id": payment.transaction_id,
         "created_at": payment.created_at,
-        "paid_at": paid_at,
+        "paid_at": None,
     }
 
 
 # ============================================================
-# ORDER EXPIRATION
+# EXPIRE ORDER
 # ============================================================
 
 def fail_expired_order(
@@ -189,10 +173,10 @@ def fail_expired_order(
     order: Order,
 ) -> bool:
     """
-    Membatalkan pesanan pending yang sudah kedaluwarsa.
+    Batalkan pesanan pending yang kedaluwarsa.
 
-    Stok hanya dikembalikan jika stock_reserved=True.
-    Pemanggil wajib melakukan commit.
+    Stok hanya dikembalikan apabila stock_reserved=True.
+    Pemanggil bertanggung jawab melakukan commit.
     """
     if order.status != "pending":
         return False
@@ -206,7 +190,7 @@ def fail_expired_order(
 
     order.status = "cancelled"
 
-    pending_payments = db.scalars(
+    payments = db.scalars(
         select(Payment)
         .where(
             Payment.order_id == order.id,
@@ -215,7 +199,7 @@ def fail_expired_order(
         .with_for_update()
     ).all()
 
-    for payment in pending_payments:
+    for payment in payments:
         payment.status = "failed"
 
     return True
@@ -290,12 +274,11 @@ def create_payment(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "Waktu pembayaran habis. "
-                    "Pesanan telah dibatalkan."
+                    "Pesanan telah dibatalkan. "
+                    "Silakan pesan tiket kembali."
                 ),
             )
 
-        # Jika pembayaran pending sudah ada, gunakan kembali
-        # agar request berulang tidak membuat pembayaran ganda.
         existing_payment = db.scalar(
             select(Payment)
             .where(
@@ -331,12 +314,6 @@ def create_payment(
 
         db.commit()
         db.refresh(payment)
-
-        # Ambil kembali nilai yang sudah tersimpan.
-        result = payment_to_response(
-            payment,
-            payload.payment_provider,
-        )
 
         return result
 
@@ -382,8 +359,7 @@ def confirm_payment(
     """
     Konfirmasi pembayaran simulasi.
 
-    Catatan:
-    Endpoint ini bukan verifikasi transaksi dari payment gateway.
+    Endpoint ini bukan verifikasi dari payment gateway sungguhan.
     """
     try:
         initial_payment = db.get(
@@ -397,7 +373,7 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan.",
             )
 
-        # Kunci order terlebih dahulu.
+        # Kunci pesanan sebelum mengunci pembayaran.
         order = get_order_for_update(
             db,
             initial_payment.order_id,
@@ -412,9 +388,7 @@ def confirm_payment(
         if order.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail=(
-                    "Anda tidak memiliki akses ke pembayaran ini."
-                ),
+                detail="Anda tidak memiliki akses ke pembayaran ini.",
             )
 
         payment = get_payment_for_update(
@@ -422,19 +396,13 @@ def confirm_payment(
             payment_id,
         )
 
-        if payment is None:
+        if payment is None or payment.order_id != order.id:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Pembayaran tidak ditemukan.",
+                detail="Pembayaran tidak ditemukan untuk pesanan ini.",
             )
 
-        if payment.order_id != order.id:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="Data pembayaran tidak sesuai dengan pesanan.",
-            )
-
-        if payment.status == "success":
+        if payment.status == "success" and order.status == "paid":
             return {
                 "message": "Pembayaran sudah berhasil.",
                 "payment_id": payment.id,
@@ -473,17 +441,12 @@ def confirm_payment(
                 ),
             )
 
-        # Tidak mengurangi stok lagi di sini.
-        # Stok sudah direservasi ketika order dibuat.
+        # Stok sudah direservasi saat order dibuat.
+        # Jangan kurangi stok untuk kedua kalinya.
         payment.status = "success"
         order.status = "paid"
 
-        # updated_at digunakan sebagai waktu perubahan status
-        # jika model/database mengelolanya.
-        if hasattr(payment, "updated_at"):
-            payment.updated_at = utc_now()
-
-        # Stok tetap terpakai karena pesanan sudah dibayar.
+        # Reservasi selesai, tetapi stok tetap terpakai.
         order.stock_reserved = False
 
         db.commit()
@@ -553,6 +516,8 @@ def get_my_payments(
             .order_by(Payment.id.desc())
         ).all()
 
+        # Provider tidak dapat dipulihkan dari database karena
+        # model Payment belum memiliki kolom payment_provider.
         return [
             payment_to_response(payment)
             for payment in payments
@@ -568,4 +533,16 @@ def get_my_payments(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Daftar pembayaran gagal dimuat.",
+        )
+
+    except Exception:
+        db.rollback()
+
+        logger.exception(
+            "Kesalahan saat mengambil daftar pembayaran."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Terjadi kesalahan saat memuat daftar pembayaran.",
         )
