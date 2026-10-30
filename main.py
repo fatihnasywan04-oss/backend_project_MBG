@@ -1,6 +1,8 @@
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -14,6 +16,10 @@ from routes.payment_routes import router as payment_router
 from routes.admin_routes import router as admin_router
 
 
+# =========================================================
+# KONFIGURASI APLIKASI
+# =========================================================
+
 app = FastAPI(
     title="API Event Ticketers",
     description="Backend aplikasi pembelian tiket event",
@@ -21,9 +27,9 @@ app = FastAPI(
 )
 
 
-# =========================
+# =========================================================
 # KONFIGURASI CORS
-# =========================
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,10 +40,36 @@ app.add_middleware(
 )
 
 
-# =========================
+# =========================================================
+# KONFIGURASI PENYIMPANAN POSTER EVENT
+# =========================================================
+
+# Lokasi folder backend.
+BASE_DIR = Path(__file__).resolve().parent
+
+# Folder utama untuk semua file yang diunggah.
+UPLOAD_DIR = BASE_DIR / "uploads"
+
+# Folder khusus poster event.
+EVENT_UPLOAD_DIR = UPLOAD_DIR / "events"
+
+# Buat folder jika belum tersedia.
+EVENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# Sajikan file upload melalui URL /uploads/...
+# Contoh:
+# /uploads/events/nama-file.jpg
+app.mount(
+    "/uploads",
+    StaticFiles(directory=str(UPLOAD_DIR)),
+    name="uploads",
+)
+
+
+# =========================================================
 # HALAMAN UTAMA
 # GET /
-# =========================
+# =========================================================
 
 @app.get("/")
 def home():
@@ -47,10 +79,10 @@ def home():
     }
 
 
-# =========================
+# =========================================================
 # HEALTH CHECK
 # GET /health
-# =========================
+# =========================================================
 
 @app.get("/health")
 def health():
@@ -59,10 +91,10 @@ def health():
     }
 
 
-# =========================
+# =========================================================
 # CEK KONEKSI DATABASE
 # GET /health/database
-# =========================
+# =========================================================
 
 @app.get("/health/database")
 def check_database():
@@ -83,9 +115,9 @@ def check_database():
         )
 
 
-# =========================
+# =========================================================
 # REGISTRASI ROUTER
-# =========================
+# =========================================================
 
 app.include_router(auth_router)
 app.include_router(event_router)

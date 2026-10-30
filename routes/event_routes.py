@@ -1,4 +1,14 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+import uuid
+from pathlib import Path
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    UploadFile,
+    File,
+    status,
+)
 from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
@@ -8,12 +18,32 @@ from models import Event, User, Order, Payment, TicketClass
 from schemas import EventCreate, EventUpdate, EventResponse
 from routes.auth_routes import get_current_user
 
+
 router = APIRouter(prefix="/events", tags=["Events"])
+
+
+# =========================================================
+# KONFIGURASI UPLOAD GAMBAR
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+EVENT_UPLOAD_DIR = BASE_DIR / "uploads" / "events"
+EVENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+
+ALLOWED_IMAGE_TYPES = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+}
 
 
 # =========================================================
 # ADMIN AUTHORIZATION
 # =========================================================
+
 def require_admin(current_user: User = Depends(get_current_user)):
     if current_user.role != "admin":
         raise HTTPException(
@@ -27,6 +57,7 @@ def require_admin(current_user: User = Depends(get_current_user)):
 # =========================================================
 # VALIDASI INPUT EVENT
 # =========================================================
+
 def validate_event_data(data: dict):
     if "title" in data and data["title"] is not None:
         data["title"] = data["title"].strip()
@@ -70,8 +101,87 @@ def validate_event_data(data: dict):
 
 
 # =========================================================
-# GET SEMUA EVENT
+# UPLOAD POSTER EVENT — ADMIN
+# POST /events/upload-image
 # =========================================================
+
+@router.post("/upload-image")
+async def upload_event_image(
+    file: UploadFile = File(...),
+    admin: User = Depends(require_admin),
+):
+    # Validasi tipe file berdasarkan Content-Type.
+    if file.content_type not in ALLOWED_IMAGE_TYPES:
+        await file.close()
+
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail="Format poster harus JPG, PNG, atau WEBP.",
+        )
+
+    extension = ALLOWED_IMAGE_TYPES[file.content_type]
+
+    # Nama file acak untuk mencegah benturan nama.
+    filename = f"{uuid.uuid4().hex}{extension}"
+    destination = EVENT_UPLOAD_DIR / filename
+
+    size = 0
+
+    try:
+        # Baca per bagian agar tidak memuat seluruh file sekaligus
+        # ke memori.
+        with destination.open("wb") as output:
+            while True:
+                chunk = await file.read(1024 * 1024)
+
+                if not chunk:
+                    break
+
+                size += len(chunk)
+
+                if size > MAX_IMAGE_SIZE:
+                    raise HTTPException(
+                        status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                        detail="Ukuran poster maksimal 5 MB.",
+                    )
+
+                output.write(chunk)
+
+        if size == 0:
+            destination.unlink(missing_ok=True)
+
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="File poster kosong.",
+            )
+
+        # URL relatif. Flutter perlu menggabungkannya dengan base URL.
+        return {
+            "message": "Poster berhasil diunggah.",
+            "image_url": f"/uploads/events/{filename}",
+        }
+
+    except HTTPException:
+        destination.unlink(missing_ok=True)
+        raise
+
+    except OSError:
+        destination.unlink(missing_ok=True)
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Gagal menyimpan poster.",
+        )
+
+    finally:
+        await file.close()
+
+
+# =========================================================
+# GET SEMUA EVENT
+# GET /events/
+# =========================================================
+
 @router.get("/", response_model=list[EventResponse])
 def get_events(db: Session = Depends(get_db)):
     try:
@@ -92,7 +202,9 @@ def get_events(db: Session = Depends(get_db)):
 
 # =========================================================
 # GET DETAIL EVENT
+# GET /events/{event_id}
 # =========================================================
+
 @router.get("/{event_id}", response_model=EventResponse)
 def get_event(
     event_id: int,
@@ -123,7 +235,9 @@ def get_event(
 
 # =========================================================
 # CREATE EVENT — ADMIN
+# POST /events/
 # =========================================================
+
 @router.post(
     "/",
     response_model=EventResponse,
@@ -144,9 +258,6 @@ def create_event(
 
     event_data = validate_event_data(event_data)
 
-    # Sesuaikan dengan kolom tabel events:
-    # title, description, location, event_date, price,
-    # available_tickets, image_url, created_by, is_cancelled.
     try:
         event = Event(
             **event_data,
@@ -171,7 +282,9 @@ def create_event(
 
 # =========================================================
 # UPDATE EVENT — ADMIN
+# PUT /events/{event_id}
 # =========================================================
+
 @router.put("/{event_id}", response_model=EventResponse)
 def update_event(
     event_id: int,
@@ -200,7 +313,7 @@ def update_event(
 
         update_data = data.model_dump(exclude_unset=True)
 
-        # Field yang tidak boleh diedit lewat request.
+        # Field yang tidak boleh diedit melalui request.
         update_data.pop("id", None)
         update_data.pop("created_by", None)
         update_data.pop("created_at", None)
@@ -212,7 +325,7 @@ def update_event(
             new_stock = update_data["available_tickets"]
 
             if new_stock is not None:
-                # Total tiket yang sudah dibayar.
+                # Jumlah tiket yang sudah dibayar.
                 sold_quantity = db.scalar(
                     select(
                         func.coalesce(func.sum(Order.quantity), 0)
@@ -222,7 +335,7 @@ def update_event(
                     )
                 ) or 0
 
-                # Pesanan pending yang masih memegang reservasi stok.
+                # Pesanan pending yang masih mereservasi stok.
                 reserved_quantity = db.scalar(
                     select(
                         func.coalesce(func.sum(Order.quantity), 0)
@@ -268,7 +381,9 @@ def update_event(
 
 # =========================================================
 # CANCEL EVENT — ADMIN
+# POST /events/{event_id}/cancel
 # =========================================================
+
 @router.post("/{event_id}/cancel")
 def cancel_event(
     event_id: int,
@@ -314,8 +429,7 @@ def cancel_event(
         ).all()
 
         for order in pending_orders:
-            # Kembalikan stok hanya jika pesanan memang pernah
-            # mereservasi stok.
+            # Kembalikan stok jika sebelumnya direservasi.
             if order.stock_reserved:
                 ticket_class = db.scalar(
                     select(TicketClass)
@@ -372,7 +486,9 @@ def cancel_event(
 
 # =========================================================
 # DELETE EVENT — ADMIN
+# DELETE /events/{event_id}
 # =========================================================
+
 @router.delete("/{event_id}")
 def delete_event(
     event_id: int,
