@@ -44,8 +44,17 @@ class OrderResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class UserSummary(BaseModel):
+    id: int
+    name: str
+    email: str
+
+    model_config = ConfigDict(from_attributes=True)
+
+
 class OrderHistoryResponse(OrderResponse):
     event_title: str
+    user: UserSummary | None = None
 
 
 class PaymentDetailResponse(BaseModel):
@@ -156,8 +165,20 @@ def expire_order_if_needed(
 # RESPONSE HELPERS
 # ============================================================
 
-def order_to_dict(order: Order) -> dict:
+def order_to_dict(
+    order: Order,
+    user: User | None = None,
+) -> dict:
     event = getattr(order, "event", None)
+
+    user_data = None
+
+    if user is not None:
+        user_data = {
+            "id": user.id,
+            "name": getattr(user, "name", None) or "",
+            "email": getattr(user, "email", None) or "",
+        }
 
     return {
         "id": order.id,
@@ -172,6 +193,7 @@ def order_to_dict(order: Order) -> dict:
         "event_title": (
             event.title if event is not None else "Event tidak tersedia"
         ),
+        "user": user_data,
     }
 
 
@@ -335,7 +357,10 @@ def get_my_orders(
         if changed:
             db.commit()
 
-        return [order_to_dict(order) for order in orders]
+        return [
+            order_to_dict(order, user=current_user)
+            for order in orders
+        ]
 
     except HTTPException:
         db.rollback()
@@ -343,7 +368,9 @@ def get_my_orders(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat mengambil riwayat pesanan.")
+        logger.exception(
+            "Database error saat mengambil riwayat pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -352,7 +379,9 @@ def get_my_orders(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membaca riwayat pesanan.")
+        logger.exception(
+            "Kesalahan saat membaca riwayat pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -377,7 +406,10 @@ def get_all_orders_admin(
     try:
         orders = db.scalars(
             select(Order)
-            .options(joinedload(Order.event))
+            .options(
+                joinedload(Order.event),
+                joinedload(Order.user),
+            )
             .order_by(Order.created_at.desc())
             .with_for_update(of=Order)
         ).unique().all()
@@ -391,7 +423,10 @@ def get_all_orders_admin(
         if changed:
             db.commit()
 
-        return [order_to_dict(order) for order in orders]
+        return [
+            order_to_dict(order, user=order.user)
+            for order in orders
+        ]
 
     except HTTPException:
         db.rollback()
@@ -399,7 +434,9 @@ def get_all_orders_admin(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat mengambil semua pesanan.")
+        logger.exception(
+            "Database error saat mengambil semua pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -408,7 +445,9 @@ def get_all_orders_admin(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membaca semua pesanan.")
+        logger.exception(
+            "Kesalahan saat membaca semua pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -445,7 +484,9 @@ def get_order_detail(
         if order is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Pesanan tidak ditemukan atau bukan milik akun ini.",
+                detail=(
+                    "Pesanan tidak ditemukan atau bukan milik akun ini."
+                ),
             )
 
         if expire_order_if_needed(db, order):
@@ -458,7 +499,10 @@ def get_order_detail(
             .order_by(Payment.id.desc())
         )
 
-        result = order_to_dict(order)
+        result = order_to_dict(
+            order,
+            user=current_user,
+        )
         result["payment"] = payment_to_dict(payment)
 
         return result
@@ -469,7 +513,9 @@ def get_order_detail(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat mengambil detail pesanan.")
+        logger.exception(
+            "Database error saat mengambil detail pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -478,7 +524,9 @@ def get_order_detail(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membaca detail pesanan.")
+        logger.exception(
+            "Kesalahan saat membaca detail pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -552,7 +600,9 @@ def cancel_order(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat membatalkan pesanan.")
+        logger.exception(
+            "Database error saat membatalkan pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -561,7 +611,9 @@ def cancel_order(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membatalkan pesanan.")
+        logger.exception(
+            "Kesalahan saat membatalkan pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
