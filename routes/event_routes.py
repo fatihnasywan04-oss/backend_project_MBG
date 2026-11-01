@@ -1,3 +1,4 @@
+import logging
 import uuid
 from pathlib import Path
 
@@ -18,6 +19,8 @@ from models import Event, User, Order, Payment, TicketClass
 from schemas import EventCreate, EventUpdate, EventResponse
 from routes.auth_routes import get_current_user
 
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/events", tags=["Events"])
 
@@ -89,7 +92,10 @@ def validate_event_data(data: dict):
                 detail="Harga tidak boleh negatif",
             )
 
-    if "available_tickets" in data and data["available_tickets"] is not None:
+    if (
+        "available_tickets" in data
+        and data["available_tickets"] is not None
+    ):
         if data["available_tickets"] < 0:
             raise HTTPException(
                 status_code=422,
@@ -161,6 +167,8 @@ async def upload_event_image(
         raise
 
     except OSError:
+        logger.exception("Gagal menyimpan poster event")
+
         destination.unlink(missing_ok=True)
 
         raise HTTPException(
@@ -191,8 +199,12 @@ def get_events(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception(
+            "ERROR GET EVENTS: gagal mengambil daftar event"
+        )
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Gagal mengambil daftar event",
         )
 
@@ -212,7 +224,7 @@ def get_event(
 
         if event is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event tidak ditemukan",
             )
 
@@ -224,8 +236,13 @@ def get_event(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception(
+            "ERROR GET EVENT DETAIL: event_id=%s",
+            event_id,
+        )
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Gagal mengambil detail event",
         )
 
@@ -247,7 +264,6 @@ def create_event(
 ):
     event_data = data.model_dump()
 
-    # Field yang dikelola backend.
     event_data.pop("id", None)
     event_data.pop("created_by", None)
     event_data.pop("is_cancelled", None)
@@ -271,8 +287,10 @@ def create_event(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception("ERROR CREATE EVENT")
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Event gagal disimpan",
         )
 
@@ -298,19 +316,18 @@ def update_event(
 
         if event is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event tidak ditemukan",
             )
 
         if event.is_cancelled:
             raise HTTPException(
-                status_code=400,
+                status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Event yang dibatalkan tidak dapat diedit",
             )
 
         update_data = data.model_dump(exclude_unset=True)
 
-        # Field yang tidak boleh diubah melalui request.
         update_data.pop("id", None)
         update_data.pop("created_by", None)
         update_data.pop("created_at", None)
@@ -345,7 +362,7 @@ def update_event(
 
                 if new_stock < minimum_stock:
                     raise HTTPException(
-                        status_code=409,
+                        status_code=status.HTTP_409_CONFLICT,
                         detail=(
                             "Stok tidak boleh kurang dari jumlah tiket "
                             "terjual dan yang sedang direservasi "
@@ -368,8 +385,13 @@ def update_event(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception(
+            "ERROR UPDATE EVENT: event_id=%s",
+            event_id,
+        )
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Event gagal diperbarui",
         )
 
@@ -394,7 +416,7 @@ def cancel_event(
 
         if event is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event tidak ditemukan",
             )
 
@@ -427,13 +449,23 @@ def cancel_event(
             if order.stock_reserved:
                 ticket_class = db.scalar(
                     select(TicketClass)
-                    .where(TicketClass.id == order.ticket_class_id)
+                    .where(
+                        TicketClass.id == order.ticket_class_id,
+                        TicketClass.event_id == event_id,
+                    )
                     .with_for_update()
                 )
 
-                if ticket_class is not None:
-                    ticket_class.stock += order.quantity
+                if ticket_class is None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            "Kelas tiket pesanan tidak ditemukan. "
+                            "Pembatalan event dibatalkan."
+                        ),
+                    )
 
+                ticket_class.stock += order.quantity
                 order.stock_reserved = False
 
             order.status = "cancelled"
@@ -472,8 +504,13 @@ def cancel_event(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception(
+            "ERROR CANCEL EVENT: event_id=%s",
+            event_id,
+        )
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Event gagal dibatalkan",
         )
 
@@ -498,7 +535,7 @@ def delete_event(
 
         if event is None:
             raise HTTPException(
-                status_code=404,
+                status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event tidak ditemukan",
             )
 
@@ -510,13 +547,24 @@ def delete_event(
 
         if existing_order is not None:
             raise HTTPException(
-                status_code=409,
+                status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     "Event tidak dapat dihapus permanen karena sudah "
                     "memiliki pesanan. Gunakan endpoint pembatalan event "
                     "agar riwayat pesanan dan pembayaran tetap aman."
                 ),
             )
+
+        # Hapus kelas tiket terlebih dahulu agar tidak terjadi
+        # konflik foreign key pada ticket_classes.event_id.
+        ticket_classes = db.scalars(
+            select(TicketClass).where(
+                TicketClass.event_id == event_id
+            )
+        ).all()
+
+        for ticket_class in ticket_classes:
+            db.delete(ticket_class)
 
         db.delete(event)
         db.commit()
@@ -533,7 +581,12 @@ def delete_event(
     except SQLAlchemyError:
         db.rollback()
 
+        logger.exception(
+            "ERROR DELETE EVENT: event_id=%s",
+            event_id,
+        )
+
         raise HTTPException(
-            status_code=500,
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Event gagal dihapus",
         )
