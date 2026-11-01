@@ -1,3 +1,4 @@
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -96,9 +97,17 @@ class Event(Base):
         nullable=True,
     )
 
+    # Tanggal dan waktu mulai event.
     event_date = Column(
         DateTime(timezone=True),
         nullable=False,
+    )
+
+    # Tanggal dan waktu selesai event.
+    # Nullable agar kompatibel dengan data event lama.
+    end_date = Column(
+        DateTime(timezone=True),
+        nullable=True,
     )
 
     price = Column(
@@ -146,6 +155,10 @@ class Event(Base):
         CheckConstraint(
             "available_tickets >= 0",
             name="check_event_available_tickets_nonnegative",
+        ),
+        CheckConstraint(
+            "end_date IS NULL OR end_date >= event_date",
+            name="check_event_end_date_valid",
         ),
     )
 

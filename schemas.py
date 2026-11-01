@@ -7,6 +7,7 @@ from pydantic import (
     ConfigDict,
     EmailStr,
     Field,
+    model_validator,
 )
 
 
@@ -73,10 +74,29 @@ class EventCreate(BaseModel):
         max_length=100,
     )
 
+    # Tanggal dan waktu mulai event.
     event_date: datetime
+
+    # Tanggal dan waktu selesai event.
+    # Jika tidak diisi, akan menggunakan event_date.
+    end_date: datetime | None = None
+
     price: Decimal = Field(ge=0)
     available_tickets: int = Field(ge=0)
     image_url: str | None = None
+
+    @model_validator(mode="after")
+    def validate_event_dates(self):
+        if (
+            self.end_date is not None
+            and self.end_date < self.event_date
+        ):
+            raise ValueError(
+                "Tanggal selesai tidak boleh lebih awal "
+                "dari tanggal mulai event."
+            )
+
+        return self
 
 
 # =========================================================
@@ -106,6 +126,7 @@ class EventUpdate(BaseModel):
     )
 
     event_date: datetime | None = None
+    end_date: datetime | None = None
 
     price: Decimal | None = Field(
         default=None,
@@ -119,6 +140,20 @@ class EventUpdate(BaseModel):
 
     image_url: str | None = None
 
+    @model_validator(mode="after")
+    def validate_event_dates(self):
+        if (
+            self.event_date is not None
+            and self.end_date is not None
+            and self.end_date < self.event_date
+        ):
+            raise ValueError(
+                "Tanggal selesai tidak boleh lebih awal "
+                "dari tanggal mulai event."
+            )
+
+        return self
+
 
 # =========================================================
 # EVENT RESPONSE
@@ -130,7 +165,10 @@ class EventResponse(BaseModel):
     description: str
     location: str
     category: str | None = None
+
     event_date: datetime
+    end_date: datetime | None = None
+
     price: Decimal
     available_tickets: int
     image_url: str | None = None
