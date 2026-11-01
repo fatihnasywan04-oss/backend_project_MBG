@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from decimal import Decimal
 
@@ -64,7 +65,14 @@ class EventCreate(BaseModel):
         min_length=2,
         max_length=255,
     )
-    category: str | None = None
+
+    # Contoh: Jejepangan, Musik, Olahraga, Teknologi, dll.
+    category: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=100,
+    )
+
     event_date: datetime
     price: Decimal = Field(ge=0)
     available_tickets: int = Field(ge=0)
@@ -90,16 +98,25 @@ class EventUpdate(BaseModel):
         min_length=2,
         max_length=255,
     )
-    category: str | None = None
+
+    category: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=100,
+    )
+
     event_date: datetime | None = None
+
     price: Decimal | None = Field(
         default=None,
         ge=0,
     )
+
     available_tickets: int | None = Field(
         default=None,
         ge=0,
     )
+
     image_url: str | None = None
 
 
