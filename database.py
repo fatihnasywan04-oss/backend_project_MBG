@@ -1,89 +1,157 @@
-
 import os
 from pathlib import Path
-from urllib.parse import urlsplit, urlunsplit
 
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-# Lokasi folder backend
+
+# =========================================================
+# ENVIRONMENT CONFIGURATION
+# =========================================================
+
 BASE_DIR = Path(__file__).resolve().parent
 
-# Membaca .env untuk pengembangan lokal.
-# Di hosting, DATABASE_URL sebaiknya diatur melalui Environment Variables.
 load_dotenv(BASE_DIR / ".env")
 
-# Mengambil URL database
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 if not DATABASE_URL or not DATABASE_URL.strip():
     raise RuntimeError(
         "DATABASE_URL belum diatur. "
-        "Periksa Environment Variables di dashboard hosting."
+        "Periksa file .env atau Environment Variables hosting."
     )
 
 DATABASE_URL = DATABASE_URL.strip()
 
-# Memvalidasi URL tanpa menampilkan kredensialnya
+
+# =========================================================
+# VALIDASI DATABASE URL
+# =========================================================
+
 try:
     parsed_url = make_url(DATABASE_URL)
 
-    if parsed_url.drivername not in (
-        "postgresql",
+    allowed_drivers = (
         "postgres",
+        "postgresql",
         "postgresql+psycopg",
         "postgresql+psycopg2",
-    ):
-        raise ValueError("DATABASE_URL harus menggunakan PostgreSQL.")
+    )
+
+    if parsed_url.drivername not in allowed_drivers:
+        raise ValueError(
+            "DATABASE_URL harus menggunakan PostgreSQL."
+        )
 
     if not parsed_url.host or not parsed_url.database:
         raise ValueError(
             "DATABASE_URL harus memiliki hostname dan nama database."
         )
 
+    if parsed_url.drivername == "postgres":
+        parsed_url = parsed_url.set(
+            drivername="postgresql"
+        )
+
 except Exception as exc:
     raise RuntimeError(
         "Format DATABASE_URL tidak valid. "
-        "Salin ulang connection string dari Neon Console."
+        "Periksa kembali connection string PostgreSQL/Neon."
     ) from exc
 
-# Normalisasi nama driver PostgreSQL
-if parsed_url.drivername == "postgres":
-    parsed_url = parsed_url.set(drivername="postgresql")
 
-DATABASE_URL = parsed_url.render_as_string(hide_password=False)
+DATABASE_URL = parsed_url.render_as_string(
+    hide_password=False
+)
 
-# Membuat engine database
+
+# =========================================================
+# DATABASE POOL CONFIGURATION
+# =========================================================
+
+POOL_SIZE = int(os.getenv("DB_POOL_SIZE", "5"))
+MAX_OVERFLOW = int(os.getenv("DB_MAX_OVERFLOW", "10"))
+POOL_TIMEOUT = int(os.getenv("DB_POOL_TIMEOUT", "30"))
+POOL_RECYCLE = int(os.getenv("DB_POOL_RECYCLE", "300"))
+CONNECT_TIMEOUT = int(os.getenv("DB_CONNECT_TIMEOUT", "10"))
+
+if POOL_SIZE < 1:
+    raise RuntimeError("DB_POOL_SIZE minimal 1.")
+
+if MAX_OVERFLOW < 0:
+    raise RuntimeError("DB_MAX_OVERFLOW tidak boleh negatif.")
+
+if POOL_TIMEOUT < 1 or POOL_RECYCLE < 1 or CONNECT_TIMEOUT < 1:
+    raise RuntimeError(
+        "Konfigurasi timeout database harus lebih besar dari 0."
+    )
+
+
+# =========================================================
+# DATABASE ENGINE
+# =========================================================
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,
-    pool_recycle=300,
+    pool_recycle=POOL_RECYCLE,
+    pool_size=POOL_SIZE,
+    max_overflow=MAX_OVERFLOW,
+    pool_timeout=POOL_TIMEOUT,
+    connect_args={
+        "connect_timeout": CONNECT_TIMEOUT,
+    },
 )
 
-# Membuat session database
+
+# =========================================================
+# SESSION CONFIGURATION
+# =========================================================
+
 SessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
     bind=engine,
 )
 
-# Base untuk model SQLAlchemy
+
+# =========================================================
+# SQLALCHEMY BASE
+# =========================================================
+
 Base = declarative_base()
 
 
-# Dependency untuk endpoint FastAPI
+# =========================================================
+# DATABASE DEPENDENCY
+# =========================================================
+
 def get_db():
     db = SessionLocal()
+
     try:
         yield db
+
+    except Exception:
+        db.rollback()
+        raise
+
     finally:
         db.close()
 
 
-# Fungsi untuk menguji koneksi database
-def test_connection():
-    with engine.connect() as connection:
-        connection.execute(text("SELECT 1"))
-    return True
+# =========================================================
+# TEST DATABASE CONNECTION
+# =========================================================
+
+def test_connection() -> bool:
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return True
+
+    except Exception:
+        return False

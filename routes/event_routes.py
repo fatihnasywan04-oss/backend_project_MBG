@@ -31,7 +31,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 EVENT_UPLOAD_DIR = BASE_DIR / "uploads" / "events"
 EVENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-MAX_IMAGE_SIZE = 5 * 1024 * 1024  # 5 MB
+MAX_IMAGE_SIZE = 5 * 1024 * 1024
 
 ALLOWED_IMAGE_TYPES = {
     "image/jpeg": ".jpg",
@@ -44,7 +44,9 @@ ALLOWED_IMAGE_TYPES = {
 # ADMIN AUTHORIZATION
 # =========================================================
 
-def require_admin(current_user: User = Depends(get_current_user)):
+def require_admin(
+    current_user: User = Depends(get_current_user),
+):
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -64,7 +66,7 @@ def validate_event_data(data: dict):
 
         if not data["title"]:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Judul event tidak boleh kosong",
             )
 
@@ -76,21 +78,21 @@ def validate_event_data(data: dict):
 
         if not data["location"]:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Lokasi event tidak boleh kosong",
             )
 
     if "price" in data and data["price"] is not None:
         if data["price"] < 0:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Harga tidak boleh negatif",
             )
 
     if "available_tickets" in data and data["available_tickets"] is not None:
         if data["available_tickets"] < 0:
             raise HTTPException(
-                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                status_code=422,
                 detail="Stok tiket tidak boleh negatif",
             )
 
@@ -110,7 +112,6 @@ async def upload_event_image(
     file: UploadFile = File(...),
     admin: User = Depends(require_admin),
 ):
-    # Validasi tipe file berdasarkan Content-Type.
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         await file.close()
 
@@ -121,15 +122,12 @@ async def upload_event_image(
 
     extension = ALLOWED_IMAGE_TYPES[file.content_type]
 
-    # Nama file acak untuk mencegah benturan nama.
     filename = f"{uuid.uuid4().hex}{extension}"
     destination = EVENT_UPLOAD_DIR / filename
 
     size = 0
 
     try:
-        # Baca per bagian agar tidak memuat seluruh file sekaligus
-        # ke memori.
         with destination.open("wb") as output:
             while True:
                 chunk = await file.read(1024 * 1024)
@@ -148,14 +146,11 @@ async def upload_event_image(
                 output.write(chunk)
 
         if size == 0:
-            destination.unlink(missing_ok=True)
-
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="File poster kosong.",
             )
 
-        # URL relatif. Flutter perlu menggabungkannya dengan base URL.
         return {
             "message": "Poster berhasil diunggah.",
             "image_url": f"/uploads/events/{filename}",
@@ -183,7 +178,9 @@ async def upload_event_image(
 # =========================================================
 
 @router.get("/", response_model=list[EventResponse])
-def get_events(db: Session = Depends(get_db)):
+def get_events(
+    db: Session = Depends(get_db),
+):
     try:
         events = db.scalars(
             select(Event).order_by(Event.event_date.asc())
@@ -195,7 +192,7 @@ def get_events(db: Session = Depends(get_db)):
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Gagal mengambil daftar event",
         )
 
@@ -215,7 +212,7 @@ def get_event(
 
         if event is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Event tidak ditemukan",
             )
 
@@ -228,7 +225,7 @@ def get_event(
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Gagal mengambil detail event",
         )
 
@@ -250,7 +247,7 @@ def create_event(
 ):
     event_data = data.model_dump()
 
-    # Field ini dikelola backend.
+    # Field yang dikelola backend.
     event_data.pop("id", None)
     event_data.pop("created_by", None)
     event_data.pop("is_cancelled", None)
@@ -275,7 +272,7 @@ def create_event(
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Event gagal disimpan",
         )
 
@@ -301,19 +298,19 @@ def update_event(
 
         if event is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Event tidak ditemukan",
             )
 
         if event.is_cancelled:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=400,
                 detail="Event yang dibatalkan tidak dapat diedit",
             )
 
         update_data = data.model_dump(exclude_unset=True)
 
-        # Field yang tidak boleh diedit melalui request.
+        # Field yang tidak boleh diubah melalui request.
         update_data.pop("id", None)
         update_data.pop("created_by", None)
         update_data.pop("created_at", None)
@@ -325,7 +322,6 @@ def update_event(
             new_stock = update_data["available_tickets"]
 
             if new_stock is not None:
-                # Jumlah tiket yang sudah dibayar.
                 sold_quantity = db.scalar(
                     select(
                         func.coalesce(func.sum(Order.quantity), 0)
@@ -335,7 +331,6 @@ def update_event(
                     )
                 ) or 0
 
-                # Pesanan pending yang masih mereservasi stok.
                 reserved_quantity = db.scalar(
                     select(
                         func.coalesce(func.sum(Order.quantity), 0)
@@ -350,7 +345,7 @@ def update_event(
 
                 if new_stock < minimum_stock:
                     raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
+                        status_code=409,
                         detail=(
                             "Stok tidak boleh kurang dari jumlah tiket "
                             "terjual dan yang sedang direservasi "
@@ -374,7 +369,7 @@ def update_event(
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Event gagal diperbarui",
         )
 
@@ -399,7 +394,7 @@ def cancel_event(
 
         if event is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Event tidak ditemukan",
             )
 
@@ -429,7 +424,6 @@ def cancel_event(
         ).all()
 
         for order in pending_orders:
-            # Kembalikan stok jika sebelumnya direservasi.
             if order.stock_reserved:
                 ticket_class = db.scalar(
                     select(TicketClass)
@@ -479,7 +473,7 @@ def cancel_event(
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Event gagal dibatalkan",
         )
 
@@ -504,11 +498,10 @@ def delete_event(
 
         if event is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
+                status_code=404,
                 detail="Event tidak ditemukan",
             )
 
-        # Jangan menghapus event yang memiliki riwayat pesanan.
         existing_order = db.scalar(
             select(Order.id)
             .where(Order.event_id == event_id)
@@ -517,7 +510,7 @@ def delete_event(
 
         if existing_order is not None:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
+                status_code=409,
                 detail=(
                     "Event tidak dapat dihapus permanen karena sudah "
                     "memiliki pesanan. Gunakan endpoint pembatalan event "
@@ -541,6 +534,6 @@ def delete_event(
         db.rollback()
 
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            status_code=500,
             detail="Event gagal dihapus",
         )

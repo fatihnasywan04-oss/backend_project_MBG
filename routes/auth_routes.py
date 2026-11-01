@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
@@ -8,7 +7,12 @@ import jwt
 
 from database import get_db
 from models import User
-from schemas import RegisterRequest, LoginRequest, AuthResponse, UserResponse
+from schemas import (
+    RegisterRequest,
+    LoginRequest,
+    AuthResponse,
+    UserResponse,
+)
 from auth import (
     hash_password,
     verify_password,
@@ -25,14 +29,15 @@ router = APIRouter(
 security = HTTPBearer(auto_error=False)
 
 
-# ==========================================
-# DEPENDENCY: MENDAPATKAN USER YANG LOGIN
-# ==========================================
+# =========================================================
+# DEPENDENCY: MENDAPATKAN USER YANG SEDANG LOGIN
+# =========================================================
 
 def get_current_user(
     credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: Session = Depends(get_db),
-):
+) -> User:
+
     if credentials is None or credentials.scheme.lower() != "bearer":
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -90,9 +95,9 @@ def get_current_user(
     return user
 
 
-# ==========================================
+# =========================================================
 # REGISTER USER
-# ==========================================
+# =========================================================
 
 @router.post(
     "/register",
@@ -142,12 +147,16 @@ def register(
             detail="Email sudah terdaftar",
         )
 
+    except Exception:
+        db.rollback()
+        raise
+
     return user
 
 
-# ==========================================
-# LOGIN ADMIN ATAU USER
-# ==========================================
+# =========================================================
+# LOGIN USER / ADMIN
+# =========================================================
 
 @router.post(
     "/login",
@@ -185,9 +194,9 @@ def login(
     }
 
 
-# ==========================================
+# =========================================================
 # MELIHAT AKUN YANG SEDANG LOGIN
-# ==========================================
+# =========================================================
 
 @router.get(
     "/me",

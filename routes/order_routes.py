@@ -14,9 +14,14 @@ from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
 
 
-router = APIRouter(prefix="/orders", tags=["Orders"])
+router = APIRouter(
+    prefix="/orders",
+    tags=["Orders"],
+)
+
 logger = logging.getLogger(__name__)
 
+# Masa berlaku pesanan dalam detik.
 EXPIRATION_SECONDS = 60
 
 
@@ -114,17 +119,25 @@ def order_deadline(order: Order) -> datetime | None:
     if expires_at is not None:
         return as_utc(expires_at)
 
-    created_at = as_utc(getattr(order, "created_at", None))
+    created_at = as_utc(
+        getattr(order, "created_at", None)
+    )
 
     if created_at is None:
         return None
 
-    return created_at + timedelta(seconds=EXPIRATION_SECONDS)
+    return created_at + timedelta(
+        seconds=EXPIRATION_SECONDS
+    )
 
 
 def is_expired(order: Order) -> bool:
     deadline = order_deadline(order)
-    return deadline is not None and utc_now() >= deadline
+
+    return (
+        deadline is not None
+        and utc_now() >= deadline
+    )
 
 
 def expire_order_if_needed(
@@ -132,15 +145,19 @@ def expire_order_if_needed(
     order: Order,
 ) -> bool:
     """
-    Batalkan pesanan pending yang kedaluwarsa.
+    Membatalkan pesanan pending yang sudah kedaluwarsa.
 
     Stok dikembalikan hanya jika stock_reserved=True.
-    Pemanggil bertanggung jawab melakukan commit.
+    Fungsi ini tidak melakukan commit.
     """
-    if order.status != "pending" or not is_expired(order):
+
+    if order.status != "pending":
         return False
 
-    if getattr(order, "stock_reserved", False):
+    if not is_expired(order):
+        return False
+
+    if order.stock_reserved:
         restore_order_stock(db, order)
         order.stock_reserved = False
 
@@ -176,8 +193,8 @@ def order_to_dict(
     if user is not None:
         user_data = {
             "id": user.id,
-            "name": getattr(user, "name", None) or "",
-            "email": getattr(user, "email", None) or "",
+            "name": user.name or "",
+            "email": user.email or "",
         }
 
     return {
@@ -191,13 +208,17 @@ def order_to_dict(
         "created_at": order.created_at,
         "expires_at": order_deadline(order),
         "event_title": (
-            event.title if event is not None else "Event tidak tersedia"
+            event.title
+            if event is not None
+            else "Event tidak tersedia"
         ),
         "user": user_data,
     }
 
 
-def payment_to_dict(payment: Payment | None) -> dict | None:
+def payment_to_dict(
+    payment: Payment | None,
+) -> dict | None:
     if payment is None:
         return None
 
@@ -228,6 +249,8 @@ def create_order(
     require_user(current_user)
 
     try:
+        # Kunci event agar tidak terjadi pemesanan bersamaan
+        # dengan pembatalan atau perubahan event.
         event = db.scalar(
             select(Event)
             .where(Event.id == data.event_id)
@@ -240,10 +263,13 @@ def create_order(
                 detail="Event tidak ditemukan.",
             )
 
-        if getattr(event, "is_cancelled", False):
+        if event.is_cancelled:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Event sudah dibatalkan dan tidak dapat dipesan.",
+                detail=(
+                    "Event sudah dibatalkan dan "
+                    "tidak dapat dipesan."
+                ),
             )
 
         event_date = as_utc(event.event_date)
@@ -254,6 +280,7 @@ def create_order(
                 detail="Event sudah berlangsung.",
             )
 
+        # Kunci kelas tiket sebelum memeriksa dan mengurangi stok.
         ticket_class = db.scalar(
             select(TicketClass)
             .where(
@@ -266,19 +293,26 @@ def create_order(
         if ticket_class is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Kelas tiket tidak ditemukan untuk event ini.",
+                detail=(
+                    "Kelas tiket tidak ditemukan untuk event ini."
+                ),
             )
 
-        if ticket_class.available_tickets < data.quantity:
+        if ticket_class.stock < data.quantity:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
                     "Stok kelas tiket tidak mencukupi. "
-                    f"Sisa stok: {ticket_class.available_tickets}."
+                    f"Sisa stok: {ticket_class.stock}."
                 ),
             )
 
-        total_price = Decimal(str(ticket_class.price)) * data.quantity
+        total_price = (
+            Decimal(str(ticket_class.price))
+            * data.quantity
+        )
+
+        now = utc_now()
 
         order = Order(
             user_id=current_user.id,
@@ -287,13 +321,15 @@ def create_order(
             quantity=data.quantity,
             total_price=total_price,
             status="pending",
-            expires_at=utc_now() + timedelta(
+            created_at=now,
+            expires_at=now + timedelta(
                 seconds=EXPIRATION_SECONDS
             ),
             stock_reserved=True,
         )
 
-        ticket_class.available_tickets -= data.quantity
+        # Kurangi stok kelas tiket.
+        ticket_class.stock -= data.quantity
 
         db.add(order)
         db.flush()
@@ -308,7 +344,10 @@ def create_order(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat membuat pesanan.")
+
+        logger.exception(
+            "Database error saat membuat pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -317,7 +356,10 @@ def create_order(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membuat pesanan.")
+
+        logger.exception(
+            "Kesalahan saat membuat pesanan."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -340,11 +382,18 @@ def get_my_orders(
     require_user(current_user)
 
     try:
+        # Kunci hanya baris Order yang dimiliki pengguna ini.
         orders = db.scalars(
             select(Order)
-            .options(joinedload(Order.event))
-            .where(Order.user_id == current_user.id)
-            .order_by(Order.created_at.desc())
+            .options(
+                joinedload(Order.event)
+            )
+            .where(
+                Order.user_id == current_user.id
+            )
+            .order_by(
+                Order.created_at.desc()
+            )
             .with_for_update(of=Order)
         ).unique().all()
 
@@ -358,7 +407,10 @@ def get_my_orders(
             db.commit()
 
         return [
-            order_to_dict(order, user=current_user)
+            order_to_dict(
+                order,
+                user=current_user,
+            )
             for order in orders
         ]
 
@@ -368,6 +420,7 @@ def get_my_orders(
 
     except SQLAlchemyError:
         db.rollback()
+
         logger.exception(
             "Database error saat mengambil riwayat pesanan."
         )
@@ -379,6 +432,7 @@ def get_my_orders(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Kesalahan saat membaca riwayat pesanan."
         )
@@ -410,7 +464,9 @@ def get_all_orders_admin(
                 joinedload(Order.event),
                 joinedload(Order.user),
             )
-            .order_by(Order.created_at.desc())
+            .order_by(
+                Order.created_at.desc()
+            )
             .with_for_update(of=Order)
         ).unique().all()
 
@@ -424,7 +480,10 @@ def get_all_orders_admin(
             db.commit()
 
         return [
-            order_to_dict(order, user=order.user)
+            order_to_dict(
+                order,
+                user=order.user,
+            )
             for order in orders
         ]
 
@@ -434,6 +493,7 @@ def get_all_orders_admin(
 
     except SQLAlchemyError:
         db.rollback()
+
         logger.exception(
             "Database error saat mengambil semua pesanan."
         )
@@ -445,6 +505,7 @@ def get_all_orders_admin(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Kesalahan saat membaca semua pesanan."
         )
@@ -473,7 +534,9 @@ def get_order_detail(
     try:
         order = db.scalar(
             select(Order)
-            .options(joinedload(Order.event))
+            .options(
+                joinedload(Order.event)
+            )
             .where(
                 Order.id == order_id,
                 Order.user_id == current_user.id,
@@ -485,7 +548,8 @@ def get_order_detail(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=(
-                    "Pesanan tidak ditemukan atau bukan milik akun ini."
+                    "Pesanan tidak ditemukan atau "
+                    "bukan milik akun ini."
                 ),
             )
 
@@ -495,14 +559,19 @@ def get_order_detail(
 
         payment = db.scalar(
             select(Payment)
-            .where(Payment.order_id == order.id)
-            .order_by(Payment.id.desc())
+            .where(
+                Payment.order_id == order.id
+            )
+            .order_by(
+                Payment.id.desc()
+            )
         )
 
         result = order_to_dict(
             order,
             user=current_user,
         )
+
         result["payment"] = payment_to_dict(payment)
 
         return result
@@ -513,6 +582,7 @@ def get_order_detail(
 
     except SQLAlchemyError:
         db.rollback()
+
         logger.exception(
             "Database error saat mengambil detail pesanan."
         )
@@ -524,6 +594,7 @@ def get_order_detail(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Kesalahan saat membaca detail pesanan."
         )
@@ -565,7 +636,10 @@ def cancel_order(
         if order.status != "pending":
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Hanya pesanan pending yang dapat dibatalkan.",
+                detail=(
+                    "Hanya pesanan pending yang "
+                    "dapat dibatalkan."
+                ),
             )
 
         payments = db.scalars(
@@ -580,7 +654,7 @@ def cancel_order(
         for payment in payments:
             payment.status = "failed"
 
-        if getattr(order, "stock_reserved", False):
+        if order.stock_reserved:
             restore_order_stock(db, order)
             order.stock_reserved = False
 
@@ -600,6 +674,7 @@ def cancel_order(
 
     except SQLAlchemyError:
         db.rollback()
+
         logger.exception(
             "Database error saat membatalkan pesanan."
         )
@@ -611,6 +686,7 @@ def cancel_order(
 
     except Exception:
         db.rollback()
+
         logger.exception(
             "Kesalahan saat membatalkan pesanan."
         )

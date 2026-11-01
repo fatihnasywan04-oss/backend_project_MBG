@@ -1,6 +1,8 @@
+import os
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
@@ -17,7 +19,16 @@ from routes.admin_routes import router as admin_router
 
 
 # =========================================================
-# KONFIGURASI APLIKASI
+# ENVIRONMENT CONFIGURATION
+# =========================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+load_dotenv(BASE_DIR / ".env")
+
+
+# =========================================================
+# FASTAPI APPLICATION
 # =========================================================
 
 app = FastAPI(
@@ -28,12 +39,32 @@ app = FastAPI(
 
 
 # =========================================================
-# KONFIGURASI CORS
+# CORS CONFIGURATION
 # =========================================================
+
+# Contoh .env:
+# CORS_ORIGINS=http://localhost:3000,https://domain-frontend.com
+
+cors_origins_env = os.getenv("CORS_ORIGINS", "*").strip()
+
+if cors_origins_env == "*":
+    allowed_origins = ["*"]
+else:
+    allowed_origins = [
+        origin.strip().rstrip("/")
+        for origin in cors_origins_env.split(",")
+        if origin.strip()
+    ]
+
+    if not allowed_origins:
+        raise RuntimeError(
+            "CORS_ORIGINS tidak boleh kosong. "
+            "Isi dengan '*' atau daftar URL frontend."
+        )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=allowed_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -41,24 +72,15 @@ app.add_middleware(
 
 
 # =========================================================
-# KONFIGURASI PENYIMPANAN POSTER EVENT
+# EVENT POSTER UPLOAD DIRECTORY
 # =========================================================
 
-# Lokasi folder backend.
-BASE_DIR = Path(__file__).resolve().parent
-
-# Folder utama untuk semua file yang diunggah.
 UPLOAD_DIR = BASE_DIR / "uploads"
-
-# Folder khusus poster event.
 EVENT_UPLOAD_DIR = UPLOAD_DIR / "events"
 
-# Buat folder jika belum tersedia.
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 EVENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Sajikan file upload melalui URL /uploads/...
-# Contoh:
-# /uploads/events/nama-file.jpg
 app.mount(
     "/uploads",
     StaticFiles(directory=str(UPLOAD_DIR)),
@@ -67,7 +89,7 @@ app.mount(
 
 
 # =========================================================
-# HALAMAN UTAMA
+# HOME
 # GET /
 # =========================================================
 
@@ -80,7 +102,7 @@ def home():
 
 
 # =========================================================
-# HEALTH CHECK
+# GENERAL HEALTH CHECK
 # GET /health
 # =========================================================
 
@@ -92,7 +114,7 @@ def health():
 
 
 # =========================================================
-# CEK KONEKSI DATABASE
+# DATABASE HEALTH CHECK
 # GET /health/database
 # =========================================================
 
@@ -110,13 +132,13 @@ def check_database():
 
     except SQLAlchemyError:
         raise HTTPException(
-            status_code=503,
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Koneksi database gagal",
         )
 
 
 # =========================================================
-# REGISTRASI ROUTER
+# ROUTER REGISTRATION
 # =========================================================
 
 app.include_router(auth_router)

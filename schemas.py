@@ -1,15 +1,39 @@
-from pydantic import BaseModel, ConfigDict, EmailStr, Field
+from datetime import datetime
+from decimal import Decimal
 
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+)
+
+
+# =========================================================
+# AUTHENTICATION
+# =========================================================
 
 class RegisterRequest(BaseModel):
-    name: str = Field(min_length=2, max_length=100)
+    name: str = Field(
+        min_length=2,
+        max_length=100,
+    )
+
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+
+    password: str = Field(
+        min_length=8,
+        max_length=128,
+    )
 
 
 class LoginRequest(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=1, max_length=128)
+
+    password: str = Field(
+        min_length=1,
+        max_length=128,
+    )
 
 
 class UserResponse(BaseModel):
@@ -25,31 +49,80 @@ class AuthResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
     user: UserResponse
-    
-from datetime import datetime
-from decimal import Decimal
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
+
+# =========================================================
+# EVENT CREATE
+# =========================================================
 
 class EventCreate(BaseModel):
-    title: str = Field(min_length=3, max_length=200)
-    description: str = Field(min_length=5)
-    location: str = Field(min_length=2, max_length=255)
-    event_date: datetime
-    price: Decimal = Field(ge=0)
-    available_tickets: int = Field(ge=0)
-    image_url: HttpUrl | None = None
+    title: str = Field(
+        min_length=3,
+        max_length=200,
+    )
 
+    description: str = Field(
+        min_length=5,
+    )
+
+    location: str = Field(
+        min_length=2,
+        max_length=255,
+    )
+
+    event_date: datetime
+
+    price: Decimal = Field(
+        ge=0,
+    )
+
+    available_tickets: int = Field(
+        ge=0,
+    )
+
+    image_url: str | None = None
+
+
+# =========================================================
+# EVENT UPDATE
+# =========================================================
 
 class EventUpdate(BaseModel):
-    title: str | None = Field(default=None, min_length=3, max_length=200)
-    description: str | None = Field(default=None, min_length=5)
-    location: str | None = Field(default=None, min_length=2, max_length=255)
-    event_date: datetime | None = None
-    price: Decimal | None = Field(default=None, ge=0)
-    available_tickets: int | None = Field(default=None, ge=0)
-    image_url: HttpUrl | None = None
+    title: str | None = Field(
+        default=None,
+        min_length=3,
+        max_length=200,
+    )
 
+    description: str | None = Field(
+        default=None,
+        min_length=5,
+    )
+
+    location: str | None = Field(
+        default=None,
+        min_length=2,
+        max_length=255,
+    )
+
+    event_date: datetime | None = None
+
+    price: Decimal | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    available_tickets: int | None = Field(
+        default=None,
+        ge=0,
+    )
+
+    image_url: str | None = None
+
+
+# =========================================================
+# EVENT RESPONSE
+# =========================================================
 
 class EventResponse(BaseModel):
     id: int

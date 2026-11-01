@@ -1,54 +1,59 @@
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from models import Event, Order, TicketClass
+from models import Order, TicketClass
 
 
-def restore_order_stock(db: Session, order: Order) -> None:
+def restore_order_stock(
+    db: Session,
+    order: Order,
+) -> None:
     """
-    Mengembalikan stok tiket berdasarkan pesanan.
+    Mengembalikan stok kelas tiket berdasarkan pesanan.
 
-    Jika pesanan menggunakan kelas tiket, stok dikembalikan ke
-    TicketClass. Jika tidak, stok dikembalikan ke Event.
-
-    Fungsi ini tidak melakukan commit. Transaksi dikelola oleh
-    fungsi pemanggil.
+    Ketentuan:
+    - Stok dikembalikan ke TicketClass.stock.
+    - Event.available_tickets tidak diubah.
+    - Stok hanya dikembalikan jika stock_reserved=True.
+    - Fungsi ini tidak melakukan commit.
+      Transaksi dikelola oleh fungsi pemanggil.
     """
+
+    # Mencegah pengembalian stok berulang.
+    if not order.stock_reserved:
+        return
 
     quantity = int(order.quantity)
 
     if quantity <= 0:
-        raise ValueError("Jumlah tiket pada pesanan tidak valid.")
-
-    ticket_class_id = getattr(order, "ticket_class_id", None)
-
-    if ticket_class_id is not None:
-        ticket_class = db.scalar(
-            select(TicketClass)
-            .where(
-                TicketClass.id == ticket_class_id,
-                TicketClass.event_id == order.event_id,
-            )
-            .with_for_update()
+        raise ValueError(
+            "Jumlah tiket pada pesanan tidak valid."
         )
 
-        if ticket_class is None:
-            raise ValueError(
-                "Kelas tiket untuk pesanan ini tidak ditemukan."
-            )
-
-        ticket_class.available_tickets += quantity
-
-    else:
-        event = db.scalar(
-            select(Event)
-            .where(Event.id == order.event_id)
-            .with_for_update()
+    if order.ticket_class_id is None:
+        raise ValueError(
+            "Pesanan tidak memiliki kelas tiket."
         )
 
-        if event is None:
-            raise ValueError(
-                "Event untuk pesanan ini tidak ditemukan."
-            )
+    # Kunci baris kelas tiket agar perubahan stok
+    # tidak bertabrakan dengan transaksi lain.
+    ticket_class = db.scalar(
+        select(TicketClass)
+        .where(
+            TicketClass.id == order.ticket_class_id,
+            TicketClass.event_id == order.event_id,
+        )
+        .with_for_update()
+    )
 
-        event.available_tickets += quantity
+    if ticket_class is None:
+        raise ValueError(
+            "Kelas tiket untuk pesanan ini tidak ditemukan."
+        )
+
+    # Kembalikan stok kelas tiket.
+    ticket_class.stock += quantity
+
+    # Tandai bahwa stok sudah dikembalikan.
+    # Pemanggil tetap bertanggung jawab melakukan commit.
+    order.stock_reserved = False

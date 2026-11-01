@@ -18,14 +18,38 @@ from database import Base
 # =========================================================
 # USER
 # =========================================================
+
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)
-    role = Column(String(50), nullable=False, default="user")
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    name = Column(
+        String(100),
+        nullable=False,
+    )
+
+    email = Column(
+        String(255),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    password_hash = Column(
+        String(255),
+        nullable=False,
+    )
+
+    role = Column(
+        String(50),
+        nullable=False,
+        default="user",
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -42,17 +66,55 @@ class User(Base):
 # =========================================================
 # EVENT
 # =========================================================
+
 class Event(Base):
     __tablename__ = "events"
 
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(255), nullable=False)
-    description = Column(Text, nullable=False)
-    location = Column(String(255), nullable=False)
-    event_date = Column(DateTime(timezone=True), nullable=False)
-    price = Column(Numeric(12, 2), nullable=False)
-    available_tickets = Column(Integer, nullable=False)
-    image_url = Column(String(500), nullable=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    title = Column(
+        String(255),
+        nullable=False,
+    )
+
+    description = Column(
+        Text,
+        nullable=False,
+    )
+
+    location = Column(
+        String(255),
+        nullable=False,
+    )
+
+    category = Column(
+        String(100),
+        nullable=True,
+    )
+
+    event_date = Column(
+        DateTime(timezone=True),
+        nullable=False,
+    )
+
+    price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
+
+    available_tickets = Column(
+        Integer,
+        nullable=False,
+    )
+
+    image_url = Column(
+        String(500),
+        nullable=True,
+    )
 
     created_by = Column(
         Integer,
@@ -73,8 +135,19 @@ class Event(Base):
         server_default="false",
     )
 
-    # Alias untuk kompatibilitas dengan kode yang memakai start_date.
+    # Alias untuk kompatibilitas dengan kode lama.
     start_date = synonym("event_date")
+
+    __table_args__ = (
+        CheckConstraint(
+            "price >= 0",
+            name="check_event_price_nonnegative",
+        ),
+        CheckConstraint(
+            "available_tickets >= 0",
+            name="check_event_available_tickets_nonnegative",
+        ),
+    )
 
     ticket_classes = relationship(
         "TicketClass",
@@ -90,30 +163,47 @@ class Event(Base):
 # =========================================================
 # TICKET CLASS
 # =========================================================
+
 class TicketClass(Base):
     __tablename__ = "ticket_classes"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id", ondelete="CASCADE"),
+        ForeignKey(
+            "events.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
-    name = Column(String(100), nullable=False)
-    price = Column(Numeric(12, 2), nullable=False)
+    name = Column(
+        String(100),
+        nullable=False,
+    )
 
-    # Atribut Python stock dipetakan ke kolom database available_tickets.
+    price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
+
+    # Nama atribut Python: stock
+    # Nama kolom database: available_tickets
     stock = Column(
         "available_tickets",
         Integer,
         nullable=False,
         default=0,
+        server_default="0",
     )
 
-    # Alias untuk kode yang memakai available_tickets.
+    # Alias untuk kompatibilitas API.
     available_tickets = synonym("stock")
 
     __table_args__ = (
@@ -141,10 +231,15 @@ class TicketClass(Base):
 # =========================================================
 # ORDER
 # =========================================================
+
 class Order(Base):
     __tablename__ = "orders"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     user_id = Column(
         Integer,
@@ -167,8 +262,15 @@ class Order(Base):
         index=True,
     )
 
-    quantity = Column(Integer, nullable=False)
-    total_price = Column(Numeric(12, 2), nullable=False)
+    quantity = Column(
+        Integer,
+        nullable=False,
+    )
+
+    total_price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
 
     status = Column(
         String(30),
@@ -230,30 +332,41 @@ class Order(Base):
 # =========================================================
 # PAYMENT
 # =========================================================
+
 class Payment(Base):
     __tablename__ = "payments"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     order_id = Column(
         Integer,
-        ForeignKey("orders.id", ondelete="CASCADE"),
+        ForeignKey(
+            "orders.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
-    amount = Column(Numeric(12, 2), nullable=False)
+    amount = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
 
-    # Nama kolom database: payment_method.
-    # Atribut Python method dipertahankan agar route lama tetap kompatibel.
+    # Nama atribut Python: method
+    # Nama kolom database: payment_method
     method = Column(
         "payment_method",
         String(50),
         nullable=True,
     )
 
-    # Nama kolom database: payment_status.
-    # Atribut Python status dipertahankan agar route lama tetap kompatibel.
+    # Nama atribut Python: status
+    # Nama kolom database: payment_status
     status = Column(
         "payment_status",
         String(30),
@@ -273,19 +386,17 @@ class Payment(Base):
         nullable=False,
     )
 
-    # Database memiliki paid_at, bukan updated_at.
     paid_at = Column(
         DateTime(timezone=True),
         nullable=True,
     )
 
-    # Kolom ini tersedia pada database Neon.
     payment_provider = Column(
         String(100),
         nullable=True,
     )
 
-    # Alias untuk kode yang memakai nama kolom database secara langsung.
+    # Alias untuk kompatibilitas dengan kode lama.
     payment_method = synonym("method")
     payment_status = synonym("status")
 

@@ -1,20 +1,30 @@
 import logging
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db
 from models import Order, Payment, User
-from routes.auth_routes import get_current_user
 from order_stock import restore_order_stock
+from routes.auth_routes import get_current_user
 
 
-router = APIRouter(prefix="/payments", tags=["Payments"])
+router = APIRouter(
+    prefix="/payments",
+    tags=["Payments"],
+)
+
 logger = logging.getLogger(__name__)
 
 EXPIRATION_SECONDS = 60
@@ -73,7 +83,7 @@ class PaymentResponse(BaseModel):
     order_id: int
     payment_method: str | None = None
     payment_provider: str | None = None
-    amount: float
+    amount: Decimal
     payment_status: str
     transaction_id: str | None = None
     created_at: datetime | None = None
@@ -90,7 +100,9 @@ def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
-def as_utc(value: datetime | None) -> datetime | None:
+def as_utc(
+    value: datetime | None,
+) -> datetime | None:
     if value is None:
         return None
 
@@ -100,13 +112,25 @@ def as_utc(value: datetime | None) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-def order_deadline(order: Order) -> datetime | None:
-    expires_at = getattr(order, "expires_at", None)
+def order_deadline(
+    order: Order,
+) -> datetime | None:
+    expires_at = getattr(
+        order,
+        "expires_at",
+        None,
+    )
 
     if expires_at is not None:
         return as_utc(expires_at)
 
-    created_at = as_utc(getattr(order, "created_at", None))
+    created_at = as_utc(
+        getattr(
+            order,
+            "created_at",
+            None,
+        )
+    )
 
     if created_at is None:
         return None
@@ -119,20 +143,25 @@ def order_deadline(order: Order) -> datetime | None:
 def order_is_expired(order: Order) -> bool:
     deadline = order_deadline(order)
 
-    return deadline is not None and utc_now() >= deadline
+    return (
+        deadline is not None
+        and utc_now() >= deadline
+    )
 
 
 # ============================================================
 # RESPONSE HELPER
 # ============================================================
 
-def payment_to_response(payment: Payment) -> dict:
+def payment_to_response(
+    payment: Payment,
+) -> dict:
     return {
         "id": payment.id,
         "order_id": payment.order_id,
         "payment_method": payment.method,
         "payment_provider": payment.payment_provider,
-        "amount": float(payment.amount),
+        "amount": payment.amount,
         "payment_status": payment.status,
         "transaction_id": payment.transaction_id,
         "created_at": payment.created_at,
@@ -149,16 +178,22 @@ def fail_expired_order(
     order: Order,
 ) -> bool:
     """
-    Batalkan pesanan pending yang kedaluwarsa.
+    Membatalkan pesanan pending yang sudah kedaluwarsa.
+
     Stok dikembalikan hanya jika stock_reserved=True.
-    Pemanggil bertanggung jawab melakukan commit.
+
+    Semua perubahan dilakukan dalam transaksi pemanggil.
+    Fungsi ini tidak melakukan commit.
     """
-    if order.status != "pending" or not order_is_expired(order):
+
+    if order.status != "pending":
         return False
 
-    if getattr(order, "stock_reserved", False):
+    if not order_is_expired(order):
+        return False
+
+    if order.stock_reserved:
         restore_order_stock(db, order)
-        order.stock_reserved = False
 
     order.status = "cancelled"
 
@@ -223,7 +258,10 @@ def create_payment(
             payload.order_id,
         )
 
-        if order is None or order.user_id != current_user.id:
+        if (
+            order is None
+            or order.user_id != current_user.id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Pesanan tidak ditemukan.",
@@ -239,14 +277,28 @@ def create_payment(
             )
 
         if order_is_expired(order):
-            fail_expired_order(db, order)
+            fail_expired_order(
+                db,
+                order,
+            )
+
             db.commit()
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=(
-                    "Waktu pembayaran habis. Pesanan dibatalkan. "
+                    "Waktu pembayaran habis. "
+                    "Pesanan dibatalkan. "
                     "Silakan pesan tiket kembali."
+                ),
+            )
+
+        if not order.stock_reserved:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Stok tiket untuk pesanan ini "
+                    "tidak sedang direservasi."
                 ),
             )
 
@@ -260,14 +312,20 @@ def create_payment(
         )
 
         if existing_payment is not None:
-            existing_payment.method = payload.payment_method
-            existing_payment.payment_provider = payload.payment_provider
+            existing_payment.method = (
+                payload.payment_method
+            )
 
-            db.flush()
+            existing_payment.payment_provider = (
+                payload.payment_provider
+            )
+
             db.commit()
             db.refresh(existing_payment)
 
-            return payment_to_response(existing_payment)
+            return payment_to_response(
+                existing_payment
+            )
 
         payment = Payment(
             order_id=order.id,
@@ -278,7 +336,6 @@ def create_payment(
         )
 
         db.add(payment)
-        db.flush()
         db.commit()
         db.refresh(payment)
 
@@ -290,7 +347,10 @@ def create_payment(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat membuat pembayaran.")
+
+        logger.exception(
+            "Database error saat membuat pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -299,11 +359,16 @@ def create_payment(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat membuat pembayaran.")
+
+        logger.exception(
+            "Kesalahan saat membuat pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Terjadi kesalahan saat membuat pembayaran.",
+            detail=(
+                "Terjadi kesalahan saat membuat pembayaran."
+            ),
         )
 
 
@@ -319,10 +384,17 @@ def confirm_payment(
 ):
     """
     Konfirmasi pembayaran simulasi.
-    Endpoint ini bukan verifikasi dari payment gateway sungguhan.
+
+    Endpoint ini bukan verifikasi pembayaran dari
+    payment gateway sungguhan.
     """
+
     try:
-        initial_payment = db.get(Payment, payment_id)
+        # Ambil informasi awal untuk mendapatkan order_id.
+        initial_payment = db.get(
+            Payment,
+            payment_id,
+        )
 
         if initial_payment is None:
             raise HTTPException(
@@ -330,6 +402,7 @@ def confirm_payment(
                 detail="Pembayaran tidak ditemukan.",
             )
 
+        # Kunci order terlebih dahulu.
         order = get_order_for_update(
             db,
             initial_payment.order_id,
@@ -344,21 +417,35 @@ def confirm_payment(
         if order.user_id != current_user.id:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
-                detail="Anda tidak memiliki akses ke pembayaran ini.",
+                detail=(
+                    "Anda tidak memiliki akses "
+                    "ke pembayaran ini."
+                ),
             )
 
+        # Setelah order terkunci, kunci payment.
         payment = get_payment_for_update(
             db,
             payment_id,
         )
 
-        if payment is None or payment.order_id != order.id:
+        if (
+            payment is None
+            or payment.order_id != order.id
+        ):
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Pembayaran tidak ditemukan untuk pesanan ini.",
+                detail=(
+                    "Pembayaran tidak ditemukan "
+                    "untuk pesanan ini."
+                ),
             )
 
-        if payment.status == "success" and order.status == "paid":
+        # Idempotensi: konfirmasi ulang tidak mengubah data.
+        if (
+            payment.status == "success"
+            and order.status == "paid"
+        ):
             return {
                 "message": "Pembayaran sudah berhasil.",
                 "payment_id": payment.id,
@@ -386,30 +473,51 @@ def confirm_payment(
             )
 
         if order_is_expired(order):
-            fail_expired_order(db, order)
+            fail_expired_order(
+                db,
+                order,
+            )
+
             db.commit()
 
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Waktu pembayaran habis. Pesanan telah dibatalkan.",
+                detail=(
+                    "Waktu pembayaran habis. "
+                    "Pesanan telah dibatalkan."
+                ),
             )
 
-        # Stok telah dikurangi ketika order dibuat.
-        # Jangan kurangi stok untuk kedua kalinya.
+        if not order.stock_reserved:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "Stok tiket untuk pesanan ini "
+                    "tidak sedang direservasi. "
+                    "Pembayaran tidak dapat dikonfirmasi."
+                ),
+            )
+
+        # Stok sudah dikurangi saat order dibuat.
+        # Jangan mengurangi stok untuk kedua kalinya.
         payment.status = "success"
         payment.paid_at = utc_now()
 
         order.status = "paid"
 
-        # Stok tetap terpakai setelah pembayaran berhasil.
+        # Reservasi sementara selesai.
+        # Stok tetap terpakai dan tidak dikembalikan.
         order.stock_reserved = False
 
         db.commit()
+
         db.refresh(payment)
         db.refresh(order)
 
         return {
-            "message": "Pembayaran berhasil dikonfirmasi.",
+            "message": (
+                "Pembayaran berhasil dikonfirmasi."
+            ),
             "payment_id": payment.id,
             "payment_status": payment.status,
             "order_id": order.id,
@@ -422,7 +530,10 @@ def confirm_payment(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat mengonfirmasi pembayaran.")
+
+        logger.exception(
+            "Database error saat mengonfirmasi pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -431,11 +542,16 @@ def confirm_payment(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat mengonfirmasi pembayaran.")
+
+        logger.exception(
+            "Kesalahan saat mengonfirmasi pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Terjadi kesalahan saat mengonfirmasi pembayaran.",
+            detail=(
+                "Terjadi kesalahan saat mengonfirmasi pembayaran."
+            ),
         )
 
 
@@ -461,7 +577,9 @@ def get_my_payments(
             .where(
                 Order.user_id == current_user.id,
             )
-            .order_by(Payment.id.desc())
+            .order_by(
+                Payment.id.desc()
+            )
         ).all()
 
         return [
@@ -471,7 +589,10 @@ def get_my_payments(
 
     except SQLAlchemyError:
         db.rollback()
-        logger.exception("Database error saat mengambil daftar pembayaran.")
+
+        logger.exception(
+            "Database error saat mengambil daftar pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -480,9 +601,14 @@ def get_my_payments(
 
     except Exception:
         db.rollback()
-        logger.exception("Kesalahan saat mengambil daftar pembayaran.")
+
+        logger.exception(
+            "Kesalahan saat mengambil daftar pembayaran."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Terjadi kesalahan saat memuat daftar pembayaran.",
+            detail=(
+                "Terjadi kesalahan saat memuat daftar pembayaran."
+            ),
         )
