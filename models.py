@@ -152,11 +152,13 @@ class Event(Base):
     ticket_classes = relationship(
         "TicketClass",
         back_populates="event",
+        passive_deletes=True,
     )
 
     orders = relationship(
         "Order",
         back_populates="event",
+        passive_deletes=True,
     )
 
 
@@ -225,6 +227,7 @@ class TicketClass(Base):
     orders = relationship(
         "Order",
         back_populates="ticket_class",
+        passive_deletes=True,
     )
 
 
@@ -250,14 +253,20 @@ class Order(Base):
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id"),
+        ForeignKey(
+            "events.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
 
     ticket_class_id = Column(
         Integer,
-        ForeignKey("ticket_classes.id"),
+        ForeignKey(
+            "ticket_classes.id",
+            ondelete="CASCADE",
+        ),
         nullable=False,
         index=True,
     )
@@ -326,6 +335,7 @@ class Order(Base):
         "Payment",
         back_populates="order",
         cascade="all, delete-orphan",
+        passive_deletes=True,
     )
 
 

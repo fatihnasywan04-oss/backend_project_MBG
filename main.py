@@ -1,4 +1,8 @@
+
 import os
+import asyncio
+import logging
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -9,6 +13,7 @@ from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
 from database import engine
+from event_cleanup import cleanup_expired_events
 
 from routes.auth_routes import router as auth_router
 from routes.event_routes import router as event_router
@@ -18,68 +23,44 @@ from routes.payment_routes import router as payment_router
 from routes.admin_routes import router as admin_router
 
 
-# =========================================================
-# ENVIRONMENT CONFIGURATION
-# =========================================================
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
-
 load_dotenv(BASE_DIR / ".env")
 
 
-# =========================================================
-# FASTAPI APPLICATION
-# =========================================================
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    cleanup_task = asyncio.create_task(cleanup_expired_events())
 
-app = FastAPI(
-    title="API Event Ticketers",
-    description="Backend aplikasi pembelian tiket event",
-    version="1.0.0",
-)
+    logger.info("Event cleanup otomatis berhasil dijalankan.")
+
+    try:
+        yield
+    finally:
+        cleanup_task.cancel()
+
+        try:
+            await cleanup_task
+        except asyncio.CancelledError:
+            logger.info("Event cleanup otomatis dihentikan.")
 
 
-# =========================================================
-# CORS CONFIGURATION
-# =========================================================
+app = FastAPI(lifespan=lifespan)
 
-# Contoh .env:
-# CORS_ORIGINS=http://localhost:3000,https://domain-frontend.com
-
-cors_origins_env = os.getenv("CORS_ORIGINS", "*").strip()
-
-if cors_origins_env == "*":
-    allowed_origins = ["*"]
-else:
-    allowed_origins = [
-        origin.strip().rstrip("/")
-        for origin in cors_origins_env.split(",")
-        if origin.strip()
-    ]
-
-    if not allowed_origins:
-        raise RuntimeError(
-            "CORS_ORIGINS tidak boleh kosong. "
-            "Isi dengan '*' atau daftar URL frontend."
-        )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
-    allow_credentials=False,
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-# =========================================================
-# EVENT POSTER UPLOAD DIRECTORY
-# =========================================================
-
 UPLOAD_DIR = BASE_DIR / "uploads"
-EVENT_UPLOAD_DIR = UPLOAD_DIR / "events"
-
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-EVENT_UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 app.mount(
     "/uploads",
@@ -88,58 +69,40 @@ app.mount(
 )
 
 
-# =========================================================
-# HOME
-# GET /
-# =========================================================
-
 @app.get("/")
 def home():
     return {
-        "message": "Backend Event Ticketers berhasil dijalankan",
+        "message": "Backend API berjalan",
         "status": "success",
     }
 
 
-# =========================================================
-# GENERAL HEALTH CHECK
-# GET /health
-# =========================================================
-
 @app.get("/health")
-def health():
+def health_check():
     return {
-        "status": "ok",
+        "status": "healthy",
     }
 
 
-# =========================================================
-# DATABASE HEALTH CHECK
-# GET /health/database
-# =========================================================
-
 @app.get("/health/database")
-def check_database():
+def database_health_check():
     try:
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
 
         return {
-            "status": "connected",
-            "database": "PostgreSQL",
-            "message": "Koneksi database berhasil",
+            "status": "healthy",
+            "database": "connected",
         }
 
-    except SQLAlchemyError:
+    except SQLAlchemyError as error:
+        logger.exception("Database health check gagal.")
+
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Koneksi database gagal",
+            detail="Database tidak dapat diakses.",
         )
 
-
-# =========================================================
-# ROUTER REGISTRATION
-# =========================================================
 
 app.include_router(auth_router)
 app.include_router(event_router)

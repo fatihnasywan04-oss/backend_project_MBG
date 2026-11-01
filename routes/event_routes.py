@@ -1,3 +1,4 @@
+
 import logging
 import uuid
 from pathlib import Path
@@ -10,7 +11,7 @@ from fastapi import (
     File,
     status,
 )
-from sqlalchemy import select, func
+from sqlalchemy import select, func, delete
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -57,6 +58,60 @@ def require_admin(
         )
 
     return current_user
+
+
+# =========================================================
+# PENGHAPUSAN PERMANEN EVENT
+# =========================================================
+
+def permanently_delete_event(
+    db: Session,
+    event_id: int,
+):
+    """
+    Menghapus seluruh data yang berhubungan dengan event.
+
+    Urutan:
+    1. Payment
+    2. Order
+    3. TicketClass
+    4. Event
+
+    Fungsi ini tidak melakukan commit.
+    Commit dilakukan oleh pemanggil.
+    """
+
+    order_ids = select(Order.id).where(
+        Order.event_id == event_id
+    )
+
+    # Hapus seluruh payment milik order event.
+    db.execute(
+        delete(Payment).where(
+            Payment.order_id.in_(order_ids)
+        )
+    )
+
+    # Hapus seluruh order milik event.
+    db.execute(
+        delete(Order).where(
+            Order.event_id == event_id
+        )
+    )
+
+    # Hapus seluruh kelas tiket milik event.
+    db.execute(
+        delete(TicketClass).where(
+            TicketClass.event_id == event_id
+        )
+    )
+
+    # Hapus event.
+    db.execute(
+        delete(Event).where(
+            Event.id == event_id
+        )
+    )
 
 
 # =========================================================
@@ -109,7 +164,7 @@ def validate_event_data(data: dict):
 
 
 # =========================================================
-# UPLOAD POSTER EVENT — ADMIN
+# UPLOAD GAMBAR EVENT — ADMIN
 # POST /events/upload-image
 # =========================================================
 
@@ -191,7 +246,8 @@ def get_events(
 ):
     try:
         events = db.scalars(
-            select(Event).order_by(Event.event_date.asc())
+            select(Event)
+            .order_by(Event.event_date.asc())
         ).all()
 
         return events
@@ -516,7 +572,7 @@ def cancel_event(
 
 
 # =========================================================
-# DELETE EVENT — ADMIN
+# DELETE EVENT PERMANEN — ADMIN
 # DELETE /events/{event_id}
 # =========================================================
 
@@ -539,38 +595,18 @@ def delete_event(
                 detail="Event tidak ditemukan",
             )
 
-        existing_order = db.scalar(
-            select(Order.id)
-            .where(Order.event_id == event_id)
-            .limit(1)
+        permanently_delete_event(
+            db=db,
+            event_id=event_id,
         )
 
-        if existing_order is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "Event tidak dapat dihapus permanen karena sudah "
-                    "memiliki pesanan. Gunakan endpoint pembatalan event "
-                    "agar riwayat pesanan dan pembayaran tetap aman."
-                ),
-            )
-
-        # Hapus kelas tiket terlebih dahulu agar tidak terjadi
-        # konflik foreign key pada ticket_classes.event_id.
-        ticket_classes = db.scalars(
-            select(TicketClass).where(
-                TicketClass.event_id == event_id
-            )
-        ).all()
-
-        for ticket_class in ticket_classes:
-            db.delete(ticket_class)
-
-        db.delete(event)
         db.commit()
 
         return {
-            "message": "Event berhasil dihapus",
+            "message": (
+                "Event, kelas tiket, order, dan pembayaran "
+                "berhasil dihapus permanen."
+            ),
             "event_id": event_id,
         }
 
@@ -582,11 +618,11 @@ def delete_event(
         db.rollback()
 
         logger.exception(
-            "ERROR DELETE EVENT: event_id=%s",
+            "ERROR DELETE EVENT PERMANENT: event_id=%s",
             event_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Event gagal dihapus",
+            detail="Event gagal dihapus permanen",
         )
