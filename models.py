@@ -1,4 +1,3 @@
-
 from sqlalchemy import (
     Column,
     Integer,
@@ -97,6 +96,13 @@ class Event(Base):
         nullable=True,
     )
 
+    # Username Instagram penyelenggara event.
+    # Contoh: namapenyelenggara
+    instagram_username = Column(
+        String(30),
+        nullable=True,
+    )
+
     # Tanggal dan waktu mulai event.
     event_date = Column(
         DateTime(timezone=True),
@@ -173,8 +179,6 @@ class Event(Base):
         back_populates="event",
         passive_deletes=True,
     )
-
-
 # =========================================================
 # TICKET CLASS
 # =========================================================

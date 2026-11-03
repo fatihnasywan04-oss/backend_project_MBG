@@ -1,6 +1,6 @@
-
 import logging
 import uuid
+import re
 from pathlib import Path
 
 from fastapi import (
@@ -139,6 +139,33 @@ def validate_event_data(data: dict):
                 status_code=422,
                 detail="Lokasi event tidak boleh kosong",
             )
+
+    # Validasi username Instagram.
+    if (
+        "instagram_username" in data
+        and data["instagram_username"] is not None
+    ):
+        username = str(data["instagram_username"]).strip()
+
+        # Hilangkan satu tanda @ di awal jika ada.
+        username = username.removeprefix("@").strip()
+
+        if not username:
+            data["instagram_username"] = None
+        elif (
+            len(username) > 30
+            or not re.fullmatch(r"[A-Za-z0-9._]+", username)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Username Instagram tidak valid. "
+                    "Gunakan maksimal 30 karakter berupa huruf, "
+                    "angka, titik, atau garis bawah."
+                ),
+            )
+        else:
+            data["instagram_username"] = username
 
     if "price" in data and data["price"] is not None:
         if data["price"] < 0:

@@ -1,4 +1,3 @@
-
 from datetime import datetime
 from decimal import Decimal
 
@@ -74,6 +73,13 @@ class EventCreate(BaseModel):
         max_length=100,
     )
 
+    # Username Instagram penyelenggara event.
+    instagram_username: str | None = Field(
+        default=None,
+        max_length=30,
+        pattern=r"^[A-Za-z0-9._]+$",
+    )
+
     # Tanggal dan waktu mulai event.
     event_date: datetime
 
@@ -125,6 +131,13 @@ class EventUpdate(BaseModel):
         max_length=100,
     )
 
+    # Username Instagram penyelenggara event.
+    instagram_username: str | None = Field(
+        default=None,
+        max_length=30,
+        pattern=r"^[A-Za-z0-9._]+$",
+    )
+
     event_date: datetime | None = None
     end_date: datetime | None = None
 
@@ -165,6 +178,9 @@ class EventResponse(BaseModel):
     description: str
     location: str
     category: str | None = None
+
+    # Username Instagram penyelenggara event.
+    instagram_username: str | None = None
 
     event_date: datetime
     end_date: datetime | None = None
