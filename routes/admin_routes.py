@@ -5,12 +5,16 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, ConfigDict, EmailStr
 from sqlalchemy import func, select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from database import get_db
 from models import Event, Order, Payment, User
-from schemas import AdminEventApplicationReview
+from schemas import (
+    AdminEventApplicationReview,
+    AdminEventAccountCreate,
+)
+from auth import hash_password
 from routes.auth_routes import get_current_user
 
 
@@ -170,6 +174,7 @@ def get_payment_scope_conditions(
 
 # =========================================================
 # ADMIN EVENT APPLICATIONS
+# GET /admin/admin-event-applications
 # =========================================================
 
 @router.get(
@@ -210,6 +215,11 @@ def get_admin_event_applications(
             detail="Daftar pengajuan Admin Event gagal dimuat.",
         )
 
+
+# =========================================================
+# REVIEW ADMIN EVENT APPLICATION
+# POST /admin/admin-event-applications/{user_id}/review
+# =========================================================
 
 @router.post(
     "/admin-event-applications/{user_id}/review",
@@ -296,6 +306,84 @@ def review_admin_event_application(
 
 
 # =========================================================
+# CREATE ADMIN EVENT ACCOUNT
+# POST /admin/admin-event-accounts
+# =========================================================
+
+@router.post(
+    "/admin-event-accounts",
+    response_model=AdminEventApplicationResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_admin_event_account(
+    data: AdminEventAccountCreate,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    """
+    Super Admin membuat akun Admin Event secara langsung.
+    Akun langsung aktif tanpa proses pengajuan.
+    """
+
+    name = data.name.strip()
+    email = str(data.email).strip().lower()
+
+    if len(name) < 2:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Nama minimal 2 karakter.",
+        )
+
+    existing_user = db.scalar(
+        select(User).where(User.email == email)
+    )
+
+    if existing_user:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email sudah terdaftar.",
+        )
+
+    admin_event = User(
+        name=name,
+        email=email,
+        password_hash=hash_password(data.password),
+        role="admin_event",
+        admin_event_status="approved",
+        admin_event_reviewed_by=current_admin.id,
+        admin_event_reviewed_at=datetime.now(timezone.utc),
+        admin_event_rejection_reason=None,
+    )
+
+    try:
+        db.add(admin_event)
+        db.commit()
+        db.refresh(admin_event)
+
+        return admin_event
+
+    except IntegrityError:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Email sudah digunakan oleh akun lain.",
+        )
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal membuat akun Admin Event."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Akun Admin Event gagal dibuat.",
+        )
+
+
+# =========================================================
 # ADMIN DASHBOARD
 # GET /admin/dashboard
 # =========================================================
@@ -314,10 +402,6 @@ def get_admin_dashboard(
             event_conditions.append(
                 Event.created_by == current_user.id
             )
-
-        event_ids_query = get_owned_event_ids_query(
-            current_user
-        )
 
         total_events = count_rows(
             db,
