@@ -91,8 +91,33 @@ def require_admin(current_user: User) -> None:
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Akses hanya untuk admin.",
+            detail="Akses hanya untuk Super Admin.",
         )
+
+
+def require_approved_event_admin(current_user: User) -> None:
+    if (
+        current_user.role != "admin_event"
+        or current_user.admin_event_status != "approved"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Akses hanya untuk Admin Event yang sudah disetujui.",
+        )
+
+
+def require_transaction_admin(current_user: User) -> None:
+    if current_user.role == "admin":
+        return
+
+    if current_user.role == "admin_event":
+        require_approved_event_admin(current_user)
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Anda tidak memiliki akses untuk melihat transaksi.",
+    )
 
 
 # ============================================================
@@ -253,23 +278,19 @@ def create_order(
         # dengan pembatalan atau perubahan event.
         event = db.scalar(
             select(Event)
-            .where(Event.id == data.event_id)
+            .where(
+                Event.id == data.event_id,
+                Event.approval_status == "approved",
+                Event.is_deleted.is_(False),
+                Event.is_cancelled.is_(False),
+            )
             .with_for_update()
         )
 
         if event is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan.",
-            )
-
-        if event.is_cancelled:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=(
-                    "Event sudah dibatalkan dan "
-                    "tidak dapat dipesan."
-                ),
+                detail="Event tidak ditemukan atau belum tersedia.",
             )
 
         event_date = as_utc(event.event_date)
@@ -293,9 +314,7 @@ def create_order(
         if ticket_class is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail=(
-                    "Kelas tiket tidak ditemukan untuk event ini."
-                ),
+                detail="Kelas tiket tidak ditemukan untuk event ini.",
             )
 
         if ticket_class.stock < data.quantity:
@@ -368,7 +387,7 @@ def create_order(
 
 
 # ============================================================
-# GET MY ORDERS
+# GET MY ORDERS (USER)
 # ============================================================
 
 @router.get(
@@ -382,7 +401,6 @@ def get_my_orders(
     require_user(current_user)
 
     try:
-        # Kunci hanya baris Order yang dimiliki pengguna ini.
         orders = db.scalars(
             select(Order)
             .options(
@@ -444,7 +462,7 @@ def get_my_orders(
 
 
 # ============================================================
-# GET ALL ORDERS (ADMIN)
+# GET ORDERS (SUPER ADMIN / ADMIN EVENT)
 # ============================================================
 
 @router.get(
@@ -455,15 +473,27 @@ def get_all_orders_admin(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_admin(current_user)
+    require_transaction_admin(current_user)
 
     try:
-        orders = db.scalars(
+        query = (
             select(Order)
+            .join(Event, Order.event_id == Event.id)
             .options(
                 joinedload(Order.event),
                 joinedload(Order.user),
             )
+        )
+
+        # Admin Event hanya dapat melihat transaksi dari
+        # event yang dibuat oleh akun tersebut.
+        if current_user.role == "admin_event":
+            query = query.where(
+                Event.created_by == current_user.id
+            )
+
+        orders = db.scalars(
+            query
             .order_by(
                 Order.created_at.desc()
             )
@@ -495,7 +525,7 @@ def get_all_orders_admin(
         db.rollback()
 
         logger.exception(
-            "Database error saat mengambil semua pesanan."
+            "Database error saat mengambil data pesanan admin."
         )
 
         raise HTTPException(
@@ -507,7 +537,7 @@ def get_all_orders_admin(
         db.rollback()
 
         logger.exception(
-            "Kesalahan saat membaca semua pesanan."
+            "Kesalahan saat membaca data pesanan admin."
         )
 
         raise HTTPException(
@@ -529,19 +559,37 @@ def get_order_detail(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    require_user(current_user)
-
     try:
-        order = db.scalar(
+        query = (
             select(Order)
+            .join(Event, Order.event_id == Event.id)
             .options(
-                joinedload(Order.event)
+                joinedload(Order.event),
+                joinedload(Order.user),
             )
-            .where(
-                Order.id == order_id,
-                Order.user_id == current_user.id,
+            .where(Order.id == order_id)
+        )
+
+        if current_user.role == "user":
+            query = query.where(
+                Order.user_id == current_user.id
             )
-            .with_for_update(of=Order)
+
+        elif current_user.role == "admin_event":
+            require_approved_event_admin(current_user)
+
+            query = query.where(
+                Event.created_by == current_user.id
+            )
+
+        elif current_user.role != "admin":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Anda tidak memiliki akses ke detail pesanan.",
+            )
+
+        order = db.scalar(
+            query.with_for_update(of=Order)
         )
 
         if order is None:
@@ -549,7 +597,7 @@ def get_order_detail(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=(
                     "Pesanan tidak ditemukan atau "
-                    "bukan milik akun ini."
+                    "Anda tidak memiliki akses."
                 ),
             )
 
@@ -569,7 +617,7 @@ def get_order_detail(
 
         result = order_to_dict(
             order,
-            user=current_user,
+            user=order.user,
         )
 
         result["payment"] = payment_to_dict(payment)
@@ -606,7 +654,7 @@ def get_order_detail(
 
 
 # ============================================================
-# CANCEL ORDER
+# CANCEL ORDER (USER)
 # ============================================================
 
 @router.delete("/{order_id}")

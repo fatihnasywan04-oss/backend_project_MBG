@@ -132,6 +132,7 @@ def register(
         email=email,
         password_hash=hash_password(data.password),
         role="user",
+        admin_event_status="none",
     )
 
     try:
@@ -155,7 +156,7 @@ def register(
 
 
 # =========================================================
-# LOGIN USER / ADMIN
+# LOGIN USER / ADMIN EVENT / SUPER ADMIN
 # =========================================================
 
 @router.post(
@@ -192,6 +193,62 @@ def login(
         "token_type": "bearer",
         "user": user,
     }
+
+
+# =========================================================
+# PENGAJUAN AKUN ADMIN EVENT
+# =========================================================
+
+@router.post(
+    "/admin-event/apply",
+    response_model=UserResponse,
+)
+def apply_admin_event(
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    # Super Admin tidak perlu mengajukan Admin Event.
+    if current_user.role == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Akun Super Admin tidak memerlukan pengajuan Admin Event.",
+        )
+
+    # Akun yang sudah menjadi Admin Event tidak perlu mengajukan ulang.
+    if current_user.role == "admin_event":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Akun Anda sudah memiliki role Admin Event.",
+        )
+
+    # Jangan izinkan pengajuan berulang saat masih pending.
+    if current_user.admin_event_status == "pending":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pengajuan Admin Event Anda masih menunggu persetujuan.",
+        )
+
+    # Akun yang sudah disetujui tidak perlu mengajukan ulang.
+    if current_user.admin_event_status == "approved":
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Pengajuan Admin Event Anda sudah disetujui.",
+        )
+
+    current_user.admin_event_status = "pending"
+    current_user.admin_event_reviewed_by = None
+    current_user.admin_event_reviewed_at = None
+    current_user.admin_event_rejection_reason = None
+
+    try:
+        db.commit()
+        db.refresh(current_user)
+
+    except Exception:
+        db.rollback()
+        raise
+
+    return current_user
 
 
 # =========================================================

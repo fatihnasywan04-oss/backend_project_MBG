@@ -1,5 +1,3 @@
-
-import os
 import asyncio
 import logging
 from contextlib import asynccontextmanager
@@ -12,6 +10,21 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+
+# ============================================================
+# ENVIRONMENT
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+# Load .env sebelum mengimpor modul yang menggunakan database.
+load_dotenv(BASE_DIR / ".env")
+
+
+# ============================================================
+# APPLICATION IMPORTS
+# ============================================================
+
 from database import engine
 from event_cleanup import cleanup_expired_events
 
@@ -23,32 +36,58 @@ from routes.payment_routes import router as payment_router
 from routes.admin_routes import router as admin_router
 
 
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(__file__).resolve().parent
-load_dotenv(BASE_DIR / ".env")
 
+# ============================================================
+# LIFESPAN
+# ============================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    cleanup_task = asyncio.create_task(cleanup_expired_events())
+    cleanup_task = asyncio.create_task(
+        cleanup_expired_events()
+    )
 
-    logger.info("Event cleanup otomatis berhasil dijalankan.")
+    logger.info(
+        "Event cleanup otomatis berhasil dijalankan."
+    )
 
     try:
         yield
+
     finally:
         cleanup_task.cancel()
 
         try:
             await cleanup_task
+
         except asyncio.CancelledError:
-            logger.info("Event cleanup otomatis dihentikan.")
+            logger.info(
+                "Event cleanup otomatis dihentikan."
+            )
 
 
-app = FastAPI(lifespan=lifespan)
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
 
+app = FastAPI(
+    title="Hikari API",
+    description="Backend API untuk aplikasi event dan ticketing Hikari.",
+    version="1.0.0",
+    lifespan=lifespan,
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -59,8 +98,15 @@ app.add_middleware(
 )
 
 
+# ============================================================
+# STATIC FILES
+# ============================================================
+
 UPLOAD_DIR = BASE_DIR / "uploads"
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True,
+)
 
 app.mount(
     "/uploads",
@@ -69,13 +115,21 @@ app.mount(
 )
 
 
+# ============================================================
+# ROOT
+# ============================================================
+
 @app.get("/")
 def home():
     return {
-        "message": "Backend API berjalan",
+        "message": "Backend API Hikari berjalan.",
         "status": "success",
     }
 
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
 
 @app.get("/health")
 def health_check():
@@ -95,14 +149,20 @@ def database_health_check():
             "database": "connected",
         }
 
-    except SQLAlchemyError as error:
-        logger.exception("Database health check gagal.")
+    except SQLAlchemyError:
+        logger.exception(
+            "Database health check gagal."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Database tidak dapat diakses.",
         )
 
+
+# ============================================================
+# ROUTERS
+# ============================================================
 
 app.include_router(auth_router)
 app.include_router(event_router)

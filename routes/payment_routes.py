@@ -93,6 +93,18 @@ class PaymentResponse(BaseModel):
 
 
 # ============================================================
+# AUTHORIZATION
+# ============================================================
+
+def require_user(current_user: User) -> None:
+    if current_user.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Fitur pembayaran hanya tersedia untuk akun pengguna.",
+        )
+
+
+# ============================================================
 # TIME HELPERS
 # ============================================================
 
@@ -181,6 +193,7 @@ def fail_expired_order(
     Membatalkan pesanan pending yang sudah kedaluwarsa.
 
     Stok dikembalikan hanya jika stock_reserved=True.
+    Setelah stok dikembalikan, stock_reserved menjadi False.
 
     Semua perubahan dilakukan dalam transaksi pemanggil.
     Fungsi ini tidak melakukan commit.
@@ -194,6 +207,7 @@ def fail_expired_order(
 
     if order.stock_reserved:
         restore_order_stock(db, order)
+        order.stock_reserved = False
 
     order.status = "cancelled"
 
@@ -252,6 +266,8 @@ def create_payment(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    require_user(current_user)
+
     try:
         order = get_order_for_update(
             db,
@@ -366,9 +382,7 @@ def create_payment(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Terjadi kesalahan saat membuat pembayaran."
-            ),
+            detail="Terjadi kesalahan saat membuat pembayaran.",
         )
 
 
@@ -388,6 +402,8 @@ def confirm_payment(
     Endpoint ini bukan verifikasi pembayaran dari
     payment gateway sungguhan.
     """
+
+    require_user(current_user)
 
     try:
         # Ambil informasi awal untuk mendapatkan order_id.
@@ -515,9 +531,7 @@ def confirm_payment(
         db.refresh(order)
 
         return {
-            "message": (
-                "Pembayaran berhasil dikonfirmasi."
-            ),
+            "message": "Pembayaran berhasil dikonfirmasi.",
             "payment_id": payment.id,
             "payment_status": payment.status,
             "order_id": order.id,
@@ -549,9 +563,7 @@ def confirm_payment(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Terjadi kesalahan saat mengonfirmasi pembayaran."
-            ),
+            detail="Terjadi kesalahan saat mengonfirmasi pembayaran.",
         )
 
 
@@ -567,6 +579,8 @@ def get_my_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    require_user(current_user)
+
     try:
         payments = db.scalars(
             select(Payment)
@@ -608,7 +622,5 @@ def get_my_payments(
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=(
-                "Terjadi kesalahan saat memuat daftar pembayaran."
-            ),
+            detail="Terjadi kesalahan saat memuat daftar pembayaran.",
         )

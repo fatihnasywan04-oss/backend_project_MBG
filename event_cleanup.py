@@ -1,54 +1,86 @@
-
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 from sqlalchemy import select, func
+from sqlalchemy.exc import SQLAlchemyError
 
 from database import SessionLocal
 from models import Event
-from routes.event_routes import permanently_delete_event
 
 
 logger = logging.getLogger(__name__)
 
+# Interval pemeriksaan event dalam detik.
 CLEANUP_INTERVAL = 60
 
 
 async def cleanup_expired_events():
     """
-    Menghapus event yang tanggal dan waktunya sudah lewat.
-    Penghapusan dilakukan melalui helper agar data orders,
-    payments, dan ticket_classes ikut terhapus.
+    Melakukan soft delete pada event yang sudah selesai.
+
+    Ketentuan:
+    - Event yang sudah selesai disembunyikan dari publik.
+    - Data event tidak dihapus permanen.
+    - TicketClass tetap tersimpan.
+    - Order dan Payment tetap tersimpan.
+    - Tidak menghapus riwayat transaksi.
+    - deleted_by bernilai None karena proses dilakukan
+      otomatis oleh sistem.
     """
 
     while True:
         db = SessionLocal()
 
         try:
-            expired_event_ids = (
-                db.execute(
-                    select(Event.id)
-                    .where(Event.event_date < func.now())
-                    .with_for_update(skip_locked=True)
+            now = datetime.now(timezone.utc)
+
+            # Gunakan end_date jika tersedia.
+            # Jika end_date kosong, gunakan event_date.
+            expired_events = db.scalars(
+                select(Event)
+                .where(
+                    func.coalesce(
+                        Event.end_date,
+                        Event.event_date,
+                    ) < func.now(),
+                    Event.is_deleted.is_(False),
                 )
-                .scalars()
-                .all()
-            )
+                .with_for_update(
+                    skip_locked=True
+                )
+            ).all()
 
-            if expired_event_ids:
-                for event_id in expired_event_ids:
-                    permanently_delete_event(db, event_id)
+            deleted_count = 0
 
+            for event in expired_events:
+                event.is_deleted = True
+                event.deleted_at = now
+                event.deleted_by = None
+
+                deleted_count += 1
+
+            if deleted_count > 0:
                 db.commit()
 
                 logger.info(
-                    "Berhasil menghapus %s event yang sudah lewat.",
-                    len(expired_event_ids),
+                    "Berhasil melakukan soft delete pada %s event yang sudah selesai.",
+                    deleted_count,
                 )
+
+        except SQLAlchemyError:
+            db.rollback()
+
+            logger.exception(
+                "Database error saat menjalankan event cleanup."
+            )
 
         except Exception:
             db.rollback()
-            logger.exception("Gagal menjalankan pembersihan event.")
+
+            logger.exception(
+                "Kesalahan saat menjalankan event cleanup."
+            )
 
         finally:
             db.close()

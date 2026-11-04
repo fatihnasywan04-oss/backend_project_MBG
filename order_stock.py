@@ -15,11 +15,12 @@ def restore_order_stock(
     - Stok dikembalikan ke TicketClass.stock.
     - Event.available_tickets tidak diubah.
     - Stok hanya dikembalikan jika stock_reserved=True.
-    - Fungsi ini tidak melakukan commit.
+    - Mencegah pengembalian stok berulang.
+    - Tidak melakukan commit.
       Transaksi dikelola oleh fungsi pemanggil.
     """
 
-    # Mencegah pengembalian stok berulang.
+    # Pastikan stok belum pernah dikembalikan.
     if not order.stock_reserved:
         return
 
@@ -35,8 +36,8 @@ def restore_order_stock(
             "Pesanan tidak memiliki kelas tiket."
         )
 
-    # Kunci baris kelas tiket agar perubahan stok
-    # tidak bertabrakan dengan transaksi lain.
+    # Kunci baris kelas tiket untuk mencegah
+    # konflik perubahan stok bersamaan.
     ticket_class = db.scalar(
         select(TicketClass)
         .where(
@@ -55,5 +56,6 @@ def restore_order_stock(
     ticket_class.stock += quantity
 
     # Tandai bahwa stok sudah dikembalikan.
-    # Pemanggil tetap bertanggung jawab melakukan commit.
     order.stock_reserved = False
+
+    # Commit dilakukan oleh fungsi pemanggil.

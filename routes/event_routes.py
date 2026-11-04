@@ -2,6 +2,7 @@ import logging
 import uuid
 import re
 from pathlib import Path
+from datetime import datetime, timezone
 
 from fastapi import (
     APIRouter,
@@ -11,19 +12,40 @@ from fastapi import (
     File,
     status,
 )
-from sqlalchemy import select, func, delete
+from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Event, User, Order, Payment, TicketClass
-from schemas import EventCreate, EventUpdate, EventResponse
+from models import (
+    Event,
+    User,
+    Order,
+    Payment,
+    TicketClass,
+    EventUpdateRequest,
+    EventDeletionRequest,
+)
+from schemas import (
+    EventCreate,
+    EventUpdate,
+    EventResponse,
+    EventApprovalReview,
+    EventUpdateRequestResponse,
+    EventUpdateRequestReview,
+    EventDeletionRequestCreate,
+    EventDeletionRequestResponse,
+    EventDeletionRequestReview,
+)
 from routes.auth_routes import get_current_user
 
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/events", tags=["Events"])
+router = APIRouter(
+    prefix="/events",
+    tags=["Events"],
+)
 
 
 # =========================================================
@@ -45,73 +67,78 @@ ALLOWED_IMAGE_TYPES = {
 
 
 # =========================================================
-# ADMIN AUTHORIZATION
+# KONSTANTA
+# =========================================================
+
+ALLOWED_EVENT_FIELDS = {
+    "title",
+    "description",
+    "location",
+    "category",
+    "instagram_username",
+    "event_date",
+    "end_date",
+    "price",
+    "available_tickets",
+    "image_url",
+}
+
+ALLOWED_TICKET_FIELDS = {
+    "name",
+    "price",
+    "available_tickets",
+}
+
+
+# =========================================================
+# AUTHORIZATION
 # =========================================================
 
 def require_admin(
     current_user: User = Depends(get_current_user),
-):
+) -> User:
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Akses hanya untuk admin",
+            detail="Akses hanya untuk Super Admin.",
         )
 
     return current_user
 
 
-# =========================================================
-# PENGHAPUSAN PERMANEN EVENT
-# =========================================================
+def require_event_admin(
+    current_user: User = Depends(get_current_user),
+) -> User:
+    if current_user.role not in ("admin", "admin_event"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Akses hanya untuk admin.",
+        )
 
-def permanently_delete_event(
-    db: Session,
-    event_id: int,
+    if (
+        current_user.role == "admin_event"
+        and current_user.admin_event_status != "approved"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Akun Admin Event belum disetujui.",
+        )
+
+    return current_user
+
+
+def ensure_event_owner(
+    event: Event,
+    current_user: User,
 ):
-    """
-    Menghapus seluruh data yang berhubungan dengan event.
-
-    Urutan:
-    1. Payment
-    2. Order
-    3. TicketClass
-    4. Event
-
-    Fungsi ini tidak melakukan commit.
-    Commit dilakukan oleh pemanggil.
-    """
-
-    order_ids = select(Order.id).where(
-        Order.event_id == event_id
-    )
-
-    # Hapus seluruh payment milik order event.
-    db.execute(
-        delete(Payment).where(
-            Payment.order_id.in_(order_ids)
+    if (
+        current_user.role == "admin_event"
+        and event.created_by != current_user.id
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Anda hanya dapat mengelola event milik sendiri.",
         )
-    )
-
-    # Hapus seluruh order milik event.
-    db.execute(
-        delete(Order).where(
-            Order.event_id == event_id
-        )
-    )
-
-    # Hapus seluruh kelas tiket milik event.
-    db.execute(
-        delete(TicketClass).where(
-            TicketClass.event_id == event_id
-        )
-    )
-
-    # Hapus event.
-    db.execute(
-        delete(Event).where(
-            Event.id == event_id
-        )
-    )
 
 
 # =========================================================
@@ -125,11 +152,17 @@ def validate_event_data(data: dict):
         if not data["title"]:
             raise HTTPException(
                 status_code=422,
-                detail="Judul event tidak boleh kosong",
+                detail="Judul event tidak boleh kosong.",
             )
 
     if "description" in data and data["description"] is not None:
         data["description"] = data["description"].strip()
+
+        if not data["description"]:
+            raise HTTPException(
+                status_code=422,
+                detail="Deskripsi event tidak boleh kosong.",
+            )
 
     if "location" in data and data["location"] is not None:
         data["location"] = data["location"].strip()
@@ -137,21 +170,19 @@ def validate_event_data(data: dict):
         if not data["location"]:
             raise HTTPException(
                 status_code=422,
-                detail="Lokasi event tidak boleh kosong",
+                detail="Lokasi event tidak boleh kosong.",
             )
 
-    # Validasi username Instagram.
     if (
         "instagram_username" in data
         and data["instagram_username"] is not None
     ):
         username = str(data["instagram_username"]).strip()
-
-        # Hilangkan satu tanda @ di awal jika ada.
         username = username.removeprefix("@").strip()
 
         if not username:
             data["instagram_username"] = None
+
         elif (
             len(username) > 30
             or not re.fullmatch(r"[A-Za-z0-9._]+", username)
@@ -164,6 +195,7 @@ def validate_event_data(data: dict):
                     "angka, titik, atau garis bawah."
                 ),
             )
+
         else:
             data["instagram_username"] = username
 
@@ -171,7 +203,7 @@ def validate_event_data(data: dict):
         if data["price"] < 0:
             raise HTTPException(
                 status_code=422,
-                detail="Harga tidak boleh negatif",
+                detail="Harga tidak boleh negatif.",
             )
 
     if (
@@ -181,7 +213,7 @@ def validate_event_data(data: dict):
         if data["available_tickets"] < 0:
             raise HTTPException(
                 status_code=422,
-                detail="Stok tiket tidak boleh negatif",
+                detail="Stok tiket tidak boleh negatif.",
             )
 
     if "image_url" in data and data["image_url"] is not None:
@@ -190,15 +222,493 @@ def validate_event_data(data: dict):
     return data
 
 
+def parse_datetime_value(value):
+    """
+    JSON pada EventUpdateRequest dapat menyimpan datetime
+    sebagai string ISO. Konversikan kembali sebelum diterapkan
+    ke model Event.
+    """
+    if value is None or isinstance(value, datetime):
+        return value
+
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(
+                value.replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise HTTPException(
+                status_code=422,
+                detail="Format tanggal event tidak valid.",
+            )
+
+    raise HTTPException(
+        status_code=422,
+        detail="Format tanggal event tidak valid.",
+    )
+
+
+def normalize_event_dates(data: dict):
+    for field in ("event_date", "end_date"):
+        if field in data:
+            data[field] = parse_datetime_value(data[field])
+
+    return data
+
+
+def validate_event_dates(
+    update_data: dict,
+    event: Event,
+):
+    new_start = update_data.get(
+        "event_date",
+        event.event_date,
+    )
+
+    new_end = update_data.get(
+        "end_date",
+        event.end_date,
+    )
+
+    if new_start is not None and new_end is not None:
+        # Hindari TypeError saat membandingkan datetime
+        # dengan timezone berbeda.
+        if (
+            (new_start.tzinfo is None)
+            != (new_end.tzinfo is None)
+        ):
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Format timezone tanggal mulai dan selesai "
+                    "harus konsisten."
+                ),
+            )
+
+        if new_end < new_start:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Tanggal selesai tidak boleh lebih awal "
+                    "dari tanggal mulai event."
+                ),
+            )
+
+
 # =========================================================
-# UPLOAD GAMBAR EVENT — ADMIN
+# VALIDASI STOK EVENT
+# =========================================================
+
+def get_minimum_event_stock(
+    db: Session,
+    event_id: int,
+) -> int:
+    sold_quantity = db.scalar(
+        select(
+            func.coalesce(
+                func.sum(Order.quantity),
+                0,
+            )
+        ).where(
+            Order.event_id == event_id,
+            Order.status == "paid",
+        )
+    ) or 0
+
+    reserved_quantity = db.scalar(
+        select(
+            func.coalesce(
+                func.sum(Order.quantity),
+                0,
+            )
+        ).where(
+            Order.event_id == event_id,
+            Order.status == "pending",
+            Order.stock_reserved.is_(True),
+        )
+    ) or 0
+
+    return int(sold_quantity + reserved_quantity)
+
+
+def validate_event_stock(
+    db: Session,
+    event_id: int,
+    new_stock: int,
+):
+    minimum_stock = get_minimum_event_stock(
+        db,
+        event_id,
+    )
+
+    if new_stock < minimum_stock:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Stok tidak boleh kurang dari jumlah tiket "
+                "terjual dan yang sedang direservasi "
+                f"({minimum_stock} tiket)."
+            ),
+        )
+
+
+def get_minimum_ticket_class_stock(
+    db: Session,
+    ticket_class_id: int,
+) -> int:
+    sold_quantity = db.scalar(
+        select(
+            func.coalesce(
+                func.sum(Order.quantity),
+                0,
+            )
+        ).where(
+            Order.ticket_class_id == ticket_class_id,
+            Order.status == "paid",
+        )
+    ) or 0
+
+    reserved_quantity = db.scalar(
+        select(
+            func.coalesce(
+                func.sum(Order.quantity),
+                0,
+            )
+        ).where(
+            Order.ticket_class_id == ticket_class_id,
+            Order.status == "pending",
+            Order.stock_reserved.is_(True),
+        )
+    ) or 0
+
+    return int(sold_quantity + reserved_quantity)
+
+
+def validate_ticket_class_stock(
+    db: Session,
+    ticket_class_id: int,
+    new_stock: int,
+):
+    minimum_stock = get_minimum_ticket_class_stock(
+        db,
+        ticket_class_id,
+    )
+
+    if new_stock < minimum_stock:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "Stok kelas tiket tidak boleh kurang dari "
+                "jumlah tiket terjual dan yang sedang "
+                f"direservasi ({minimum_stock} tiket)."
+            ),
+        )
+
+
+# =========================================================
+# HELPER KELAS TIKET UNTUK APPROVAL
+# =========================================================
+
+def validate_ticket_class_data(data: dict):
+    unknown_fields = set(data.keys()) - ALLOWED_TICKET_FIELDS
+
+    if unknown_fields:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Field kelas tiket tidak diizinkan: "
+                + ", ".join(sorted(unknown_fields))
+            ),
+        )
+
+    if "name" in data:
+        if not isinstance(data["name"], str):
+            raise HTTPException(
+                status_code=422,
+                detail="Nama kelas tiket harus berupa teks.",
+            )
+
+        data["name"] = data["name"].strip()
+
+        if not data["name"]:
+            raise HTTPException(
+                status_code=422,
+                detail="Nama kelas tiket tidak boleh kosong.",
+            )
+
+        if len(data["name"]) > 30:
+            raise HTTPException(
+                status_code=422,
+                detail="Nama kelas tiket maksimal 30 karakter.",
+            )
+
+    if "price" in data:
+        try:
+            data["price"] = float(data["price"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail="Harga kelas tiket tidak valid.",
+            )
+
+        if data["price"] < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Harga kelas tiket tidak boleh negatif.",
+            )
+
+    if "available_tickets" in data:
+        try:
+            stock = int(data["available_tickets"])
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=422,
+                detail="Stok kelas tiket harus berupa bilangan bulat.",
+            )
+
+        if stock < 0:
+            raise HTTPException(
+                status_code=422,
+                detail="Stok kelas tiket tidak boleh negatif.",
+            )
+
+        data["available_tickets"] = stock
+
+    return data
+
+
+def ensure_unique_ticket_class_name(
+    db: Session,
+    event_id: int,
+    name: str,
+    exclude_id: int | None = None,
+):
+    query = select(TicketClass).where(
+        TicketClass.event_id == event_id,
+        func.lower(TicketClass.name) == name.lower(),
+    )
+
+    if exclude_id is not None:
+        query = query.where(
+            TicketClass.id != exclude_id
+        )
+
+    existing = db.scalar(query)
+
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Nama kelas tiket sudah digunakan pada event ini.",
+        )
+
+
+def apply_ticket_class_changes(
+    db: Session,
+    event: Event,
+    ticket_operations: list,
+):
+    """
+    Menjalankan operasi kelas tiket dalam transaksi approval.
+
+    Format operasi yang didukung:
+
+    {
+        "action": "create",
+        "data": {
+            "name": "VIP",
+            "price": 100000,
+            "available_tickets": 100
+        }
+    }
+
+    {
+        "action": "update",
+        "ticket_class_id": 1,
+        "data": {
+            "name": "VIP",
+            "price": 120000,
+            "available_tickets": 80
+        }
+    }
+
+    {
+        "action": "delete",
+        "ticket_class_id": 1
+    }
+    """
+
+    if not isinstance(ticket_operations, list):
+        raise HTTPException(
+            status_code=422,
+            detail="Format perubahan kelas tiket tidak valid.",
+        )
+
+    for operation in ticket_operations:
+        if not isinstance(operation, dict):
+            raise HTTPException(
+                status_code=422,
+                detail="Format operasi kelas tiket tidak valid.",
+            )
+
+        action = operation.get("action")
+
+        if action not in ("create", "update", "delete"):
+            raise HTTPException(
+                status_code=422,
+                detail="Operasi kelas tiket tidak dikenal.",
+            )
+
+        # -------------------------------------
+        # CREATE TICKET CLASS
+        # -------------------------------------
+
+        if action == "create":
+            ticket_data = operation.get("data")
+
+            if not isinstance(ticket_data, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Data kelas tiket baru tidak valid.",
+                )
+
+            ticket_data = validate_ticket_class_data(
+                dict(ticket_data)
+            )
+
+            required_fields = {
+                "name",
+                "price",
+                "available_tickets",
+            }
+
+            if not required_fields.issubset(ticket_data):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Nama, harga, dan stok wajib diisi "
+                        "untuk kelas tiket baru."
+                    ),
+                )
+
+            ensure_unique_ticket_class_name(
+                db,
+                event.id,
+                ticket_data["name"],
+            )
+
+            ticket_class = TicketClass(
+                event_id=event.id,
+                name=ticket_data["name"],
+                price=ticket_data["price"],
+                stock=ticket_data["available_tickets"],
+            )
+
+            db.add(ticket_class)
+
+        # -------------------------------------
+        # UPDATE / DELETE TICKET CLASS
+        # -------------------------------------
+
+        else:
+            ticket_class_id = operation.get(
+                "ticket_class_id"
+            )
+
+            if ticket_class_id is None:
+                raise HTTPException(
+                    status_code=422,
+                    detail="ID kelas tiket wajib diisi.",
+                )
+
+            ticket_class = db.scalar(
+                select(TicketClass)
+                .where(
+                    TicketClass.id == ticket_class_id,
+                    TicketClass.event_id == event.id,
+                )
+                .with_for_update()
+            )
+
+            if ticket_class is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Kelas tiket tidak ditemukan pada event ini.",
+                )
+
+            if action == "update":
+                ticket_data = operation.get("data")
+
+                if not isinstance(ticket_data, dict):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Data perubahan kelas tiket tidak valid.",
+                    )
+
+                ticket_data = validate_ticket_class_data(
+                    dict(ticket_data)
+                )
+
+                if not ticket_data:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Tidak ada perubahan kelas tiket.",
+                    )
+
+                if "name" in ticket_data:
+                    ensure_unique_ticket_class_name(
+                        db,
+                        event.id,
+                        ticket_data["name"],
+                        exclude_id=ticket_class.id,
+                    )
+
+                if "available_tickets" in ticket_data:
+                    validate_ticket_class_stock(
+                        db,
+                        ticket_class.id,
+                        ticket_data["available_tickets"],
+                    )
+
+                for key, value in ticket_data.items():
+                    if key == "available_tickets":
+                        ticket_class.stock = value
+                    else:
+                        setattr(ticket_class, key, value)
+
+            elif action == "delete":
+                # Jangan hapus kelas tiket yang sudah memiliki
+                # riwayat order agar foreign key dan histori aman.
+                existing_order = db.scalar(
+                    select(Order.id)
+                    .where(
+                        Order.ticket_class_id == ticket_class.id
+                    )
+                    .limit(1)
+                )
+
+                if existing_order is not None:
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=(
+                            "Kelas tiket tidak dapat dihapus karena "
+                            "sudah memiliki riwayat pesanan. "
+                            "Pertahankan kelas tiket tersebut "
+                            "untuk menjaga histori transaksi."
+                        ),
+                    )
+
+                db.delete(ticket_class)
+
+
+# =========================================================
+# UPLOAD GAMBAR EVENT
 # POST /events/upload-image
 # =========================================================
 
 @router.post("/upload-image")
 async def upload_event_image(
     file: UploadFile = File(...),
-    admin: User = Depends(require_admin),
+    current_user: User = Depends(require_event_admin),
 ):
     if file.content_type not in ALLOWED_IMAGE_TYPES:
         await file.close()
@@ -249,7 +759,9 @@ async def upload_event_image(
         raise
 
     except OSError:
-        logger.exception("Gagal menyimpan poster event")
+        logger.exception(
+            "Gagal menyimpan poster event."
+        )
 
         destination.unlink(missing_ok=True)
 
@@ -267,28 +779,34 @@ async def upload_event_image(
 # GET /events/
 # =========================================================
 
-@router.get("/", response_model=list[EventResponse])
+@router.get(
+    "/",
+    response_model=list[EventResponse],
+)
 def get_events(
     db: Session = Depends(get_db),
 ):
     try:
-        events = db.scalars(
+        return db.scalars(
             select(Event)
+            .where(
+                Event.approval_status == "approved",
+                Event.is_cancelled.is_(False),
+                Event.is_deleted.is_(False),
+            )
             .order_by(Event.event_date.asc())
         ).all()
-
-        return events
 
     except SQLAlchemyError:
         db.rollback()
 
         logger.exception(
-            "ERROR GET EVENTS: gagal mengambil daftar event"
+            "Gagal mengambil daftar event."
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Gagal mengambil daftar event",
+            detail="Gagal mengambil daftar event.",
         )
 
 
@@ -297,18 +815,28 @@ def get_events(
 # GET /events/{event_id}
 # =========================================================
 
-@router.get("/{event_id}", response_model=EventResponse)
+@router.get(
+    "/{event_id}",
+    response_model=EventResponse,
+)
 def get_event(
     event_id: int,
     db: Session = Depends(get_db),
 ):
     try:
-        event = db.get(Event, event_id)
+        event = db.scalar(
+            select(Event).where(
+                Event.id == event_id,
+                Event.approval_status == "approved",
+                Event.is_cancelled.is_(False),
+                Event.is_deleted.is_(False),
+            )
+        )
 
         if event is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan",
+                detail="Event tidak ditemukan.",
             )
 
         return event
@@ -320,18 +848,18 @@ def get_event(
         db.rollback()
 
         logger.exception(
-            "ERROR GET EVENT DETAIL: event_id=%s",
+            "Gagal mengambil detail event: event_id=%s",
             event_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Gagal mengambil detail event",
+            detail="Gagal mengambil detail event.",
         )
 
 
 # =========================================================
-# CREATE EVENT — ADMIN
+# CREATE EVENT
 # POST /events/
 # =========================================================
 
@@ -343,22 +871,35 @@ def get_event(
 def create_event(
     data: EventCreate,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    current_user: User = Depends(require_event_admin),
 ):
-    event_data = data.model_dump()
-
-    event_data.pop("id", None)
-    event_data.pop("created_by", None)
-    event_data.pop("is_cancelled", None)
-    event_data.pop("created_at", None)
-
-    event_data = validate_event_data(event_data)
+    event_data = validate_event_data(
+        data.model_dump()
+    )
 
     try:
+        is_super_admin = current_user.role == "admin"
+
         event = Event(
             **event_data,
-            created_by=admin.id,
+            created_by=current_user.id,
             is_cancelled=False,
+            is_deleted=False,
+            approval_status=(
+                "approved"
+                if is_super_admin
+                else "pending"
+            ),
+            approval_reviewed_by=(
+                current_user.id
+                if is_super_admin
+                else None
+            ),
+            approval_reviewed_at=(
+                datetime.now(timezone.utc)
+                if is_super_admin
+                else None
+            ),
         )
 
         db.add(event)
@@ -370,88 +911,133 @@ def create_event(
     except SQLAlchemyError:
         db.rollback()
 
-        logger.exception("ERROR CREATE EVENT")
+        logger.exception(
+            "Gagal membuat event."
+        )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Event gagal disimpan",
+            detail="Event gagal disimpan.",
         )
 
 
 # =========================================================
-# UPDATE EVENT — ADMIN
+# UPDATE EVENT
 # PUT /events/{event_id}
 # =========================================================
 
-@router.put("/{event_id}", response_model=EventResponse)
+@router.put("/{event_id}")
 def update_event(
     event_id: int,
     data: EventUpdate,
     db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
+    current_user: User = Depends(require_event_admin),
 ):
     try:
         event = db.scalar(
             select(Event)
-            .where(Event.id == event_id)
+            .where(
+                Event.id == event_id,
+                Event.is_deleted.is_(False),
+            )
             .with_for_update()
         )
 
         if event is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan",
+                detail="Event tidak ditemukan.",
             )
+
+        ensure_event_owner(
+            event,
+            current_user,
+        )
 
         if event.is_cancelled:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Event yang dibatalkan tidak dapat diedit",
+                detail="Event yang dibatalkan tidak dapat diedit.",
             )
 
-        update_data = data.model_dump(exclude_unset=True)
+        if event.approval_status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Event belum disetujui.",
+            )
 
-        update_data.pop("id", None)
-        update_data.pop("created_by", None)
-        update_data.pop("created_at", None)
-        update_data.pop("is_cancelled", None)
+        update_data = data.model_dump(
+            exclude_unset=True,
+        )
 
+        if not update_data:
+            raise HTTPException(
+                status_code=422,
+                detail="Tidak ada perubahan yang dikirim.",
+            )
+
+        unknown_fields = (
+            set(update_data.keys()) - ALLOWED_EVENT_FIELDS
+        )
+
+        if unknown_fields:
+            raise HTTPException(
+                status_code=422,
+                detail="Field perubahan event tidak diizinkan.",
+            )
+
+        update_data = normalize_event_dates(update_data)
         update_data = validate_event_data(update_data)
 
+        validate_event_dates(
+            update_data,
+            event,
+        )
+
+        # -------------------------------------
+        # ADMIN EVENT: AJUKAN PERUBAHAN
+        # -------------------------------------
+
+        if current_user.role == "admin_event":
+            if "available_tickets" in update_data:
+                validate_event_stock(
+                    db,
+                    event_id,
+                    update_data["available_tickets"],
+                )
+
+            request = EventUpdateRequest(
+                event_id=event.id,
+                requested_by=current_user.id,
+                proposed_data={
+                    "event": update_data,
+                    "ticket_classes": [],
+                },
+                status="pending",
+            )
+
+            db.add(request)
+            db.commit()
+            db.refresh(request)
+
+            return {
+                "message": (
+                    "Perubahan event berhasil diajukan "
+                    "dan menunggu persetujuan Super Admin."
+                ),
+                "request": request,
+            }
+
+        # -------------------------------------
+        # SUPER ADMIN: UPDATE LANGSUNG
+        # -------------------------------------
+
         if "available_tickets" in update_data:
-            new_stock = update_data["available_tickets"]
-
-            if new_stock is not None:
-                sold_quantity = db.scalar(
-                    select(
-                        func.coalesce(func.sum(Order.quantity), 0)
-                    ).where(
-                        Order.event_id == event_id,
-                        Order.status == "paid",
-                    )
-                ) or 0
-
-                reserved_quantity = db.scalar(
-                    select(
-                        func.coalesce(func.sum(Order.quantity), 0)
-                    ).where(
-                        Order.event_id == event_id,
-                        Order.status == "pending",
-                        Order.stock_reserved.is_(True),
-                    )
-                ) or 0
-
-                minimum_stock = sold_quantity + reserved_quantity
-
-                if new_stock < minimum_stock:
-                    raise HTTPException(
-                        status_code=status.HTTP_409_CONFLICT,
-                        detail=(
-                            "Stok tidak boleh kurang dari jumlah tiket "
-                            "terjual dan yang sedang direservasi "
-                            f"({minimum_stock} tiket)."
-                        ),
-                    )
+            validate_event_stock(
+                db,
+                event_id,
+                update_data["available_tickets"],
+            )
 
         for key, value in update_data.items():
             setattr(event, key, value)
@@ -469,18 +1055,565 @@ def update_event(
         db.rollback()
 
         logger.exception(
-            "ERROR UPDATE EVENT: event_id=%s",
+            "Gagal memperbarui event: event_id=%s",
             event_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Event gagal diperbarui",
+            detail="Event gagal diperbarui.",
         )
 
 
 # =========================================================
-# CANCEL EVENT — ADMIN
+# REVIEW EVENT BARU
+# POST /events/{event_id}/review
+# =========================================================
+
+@router.post("/{event_id}/review")
+def review_event(
+    event_id: int,
+    data: EventApprovalReview,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    try:
+        event = db.scalar(
+            select(Event)
+            .where(Event.id == event_id)
+            .with_for_update()
+        )
+
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan.",
+            )
+
+        if event.approval_status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Event ini tidak sedang menunggu persetujuan.",
+            )
+
+        event.approval_status = data.status
+        event.approval_reviewed_by = current_admin.id
+        event.approval_reviewed_at = datetime.now(timezone.utc)
+
+        if data.status == "rejected":
+            event.approval_rejection_reason = (
+                data.rejection_reason.strip()
+            )
+        else:
+            event.approval_rejection_reason = None
+
+        db.commit()
+        db.refresh(event)
+
+        return {
+            "message": (
+                "Event berhasil disetujui."
+                if data.status == "approved"
+                else "Event ditolak."
+            ),
+            "event": event,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal meninjau event: event_id=%s",
+            event_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pengajuan event gagal diproses.",
+        )
+
+
+# =========================================================
+# GET PENDING EVENT
+# GET /events/admin/pending
+# =========================================================
+
+@router.get(
+    "/admin/pending",
+    response_model=list[EventResponse],
+)
+def get_pending_events(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    try:
+        return db.scalars(
+            select(Event)
+            .where(
+                Event.approval_status == "pending",
+                Event.is_deleted.is_(False),
+            )
+            .order_by(Event.created_at.desc())
+        ).all()
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal mengambil event pending."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Daftar event pending gagal dimuat.",
+        )
+
+
+# =========================================================
+# GET UPDATE REQUESTS
+# GET /events/admin/update-requests
+# =========================================================
+
+@router.get(
+    "/admin/update-requests",
+    response_model=list[EventUpdateRequestResponse],
+)
+def get_event_update_requests(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    try:
+        return db.scalars(
+            select(EventUpdateRequest)
+            .order_by(EventUpdateRequest.created_at.desc())
+        ).all()
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal mengambil pengajuan perubahan event."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Daftar pengajuan perubahan gagal dimuat.",
+        )
+
+
+# =========================================================
+# REVIEW UPDATE REQUEST
+# POST /events/admin/update-requests/{request_id}/review
+# =========================================================
+
+@router.post(
+    "/admin/update-requests/{request_id}/review",
+)
+def review_event_update_request(
+    request_id: int,
+    data: EventUpdateRequestReview,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    try:
+        request = db.scalar(
+            select(EventUpdateRequest)
+            .where(EventUpdateRequest.id == request_id)
+            .with_for_update()
+        )
+
+        if request is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pengajuan perubahan tidak ditemukan.",
+            )
+
+        if request.status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pengajuan ini sudah diproses.",
+            )
+
+        event = db.scalar(
+            select(Event)
+            .where(Event.id == request.event_id)
+            .with_for_update()
+        )
+
+        if event is None or event.is_deleted:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan atau sudah dihapus.",
+            )
+
+        if event.created_by != request.requested_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pengaju bukan pemilik event.",
+            )
+
+        if data.status == "approved":
+            if event.is_cancelled:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail="Event yang dibatalkan tidak dapat diperbarui.",
+                )
+
+            proposed_data = request.proposed_data or {}
+
+            if not isinstance(proposed_data, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Format pengajuan perubahan tidak valid.",
+                )
+
+            event_changes = proposed_data.get("event", {})
+            ticket_operations = proposed_data.get(
+                "ticket_classes",
+                [],
+            )
+
+            if not isinstance(event_changes, dict):
+                raise HTTPException(
+                    status_code=422,
+                    detail="Data perubahan event tidak valid.",
+                )
+
+            unknown_fields = (
+                set(event_changes.keys()) - ALLOWED_EVENT_FIELDS
+            )
+
+            if unknown_fields:
+                raise HTTPException(
+                    status_code=422,
+                    detail="Pengajuan berisi field event yang tidak diizinkan.",
+                )
+
+            event_changes = normalize_event_dates(
+                dict(event_changes)
+            )
+
+            event_changes = validate_event_data(
+                event_changes
+            )
+
+            validate_event_dates(
+                event_changes,
+                event,
+            )
+
+            if "available_tickets" in event_changes:
+                validate_event_stock(
+                    db,
+                    event.id,
+                    event_changes["available_tickets"],
+                )
+
+            # Terapkan perubahan event.
+            for key, value in event_changes.items():
+                setattr(event, key, value)
+
+            # Terapkan seluruh operasi kelas tiket.
+            # Jika salah satu operasi gagal, transaksi dibatalkan
+            # sehingga tidak ada perubahan yang diterapkan sebagian.
+            apply_ticket_class_changes(
+                db,
+                event,
+                ticket_operations,
+            )
+
+        request.status = data.status
+        request.reviewed_by = current_admin.id
+        request.reviewed_at = datetime.now(timezone.utc)
+
+        request.rejection_reason = (
+            data.rejection_reason.strip()
+            if data.status == "rejected"
+            else None
+        )
+
+        db.commit()
+
+        return {
+            "message": (
+                "Perubahan event dan kelas tiket berhasil disetujui."
+                if data.status == "approved"
+                else "Pengajuan perubahan event ditolak."
+            ),
+            "request_id": request.id,
+            "status": request.status,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal meninjau perubahan event: request_id=%s",
+            request_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pengajuan perubahan event gagal diproses.",
+        )
+
+
+# =========================================================
+# AJUKAN PENGHAPUSAN EVENT
+# DELETE /events/{event_id}
+# =========================================================
+
+@router.delete("/{event_id}")
+def request_event_deletion(
+    event_id: int,
+    data: EventDeletionRequestCreate | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_event_admin),
+):
+    try:
+        event = db.scalar(
+            select(Event)
+            .where(
+                Event.id == event_id,
+                Event.is_deleted.is_(False),
+            )
+            .with_for_update()
+        )
+
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan.",
+            )
+
+        ensure_event_owner(
+            event,
+            current_user,
+        )
+
+        # -------------------------------------
+        # SUPER ADMIN: SOFT DELETE LANGSUNG
+        # -------------------------------------
+
+        if current_user.role == "admin":
+            event.is_deleted = True
+            event.deleted_at = datetime.now(timezone.utc)
+            event.deleted_by = current_user.id
+
+            db.commit()
+
+            return {
+                "message": "Event berhasil dihapus.",
+                "event_id": event.id,
+                "is_deleted": True,
+            }
+
+        # -------------------------------------
+        # ADMIN EVENT: AJUKAN PENGHAPUSAN
+        # -------------------------------------
+
+        if event.approval_status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Hanya event yang sudah disetujui "
+                    "yang dapat diajukan penghapusannya."
+                ),
+            )
+
+        existing_request = db.scalar(
+            select(EventDeletionRequest)
+            .where(
+                EventDeletionRequest.event_id == event_id,
+                EventDeletionRequest.status == "pending",
+            )
+            .with_for_update()
+        )
+
+        if existing_request:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Pengajuan penghapusan event masih "
+                    "menunggu persetujuan."
+                ),
+            )
+
+        request = EventDeletionRequest(
+            event_id=event.id,
+            requested_by=current_user.id,
+            reason=(
+                data.reason.strip()
+                if data and data.reason
+                else None
+            ),
+            status="pending",
+        )
+
+        db.add(request)
+        db.commit()
+        db.refresh(request)
+
+        return request
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal mengajukan penghapusan event: event_id=%s",
+            event_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pengajuan penghapusan event gagal.",
+        )
+
+
+# =========================================================
+# GET DELETION REQUESTS
+# GET /events/admin/deletion-requests
+# =========================================================
+
+@router.get(
+    "/admin/deletion-requests",
+    response_model=list[EventDeletionRequestResponse],
+)
+def get_event_deletion_requests(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    try:
+        return db.scalars(
+            select(EventDeletionRequest)
+            .order_by(EventDeletionRequest.created_at.desc())
+        ).all()
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal mengambil pengajuan penghapusan event."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Daftar pengajuan penghapusan gagal dimuat.",
+        )
+
+
+# =========================================================
+# REVIEW DELETION REQUEST
+# POST /events/admin/deletion-requests/{request_id}/review
+# =========================================================
+
+@router.post(
+    "/admin/deletion-requests/{request_id}/review",
+)
+def review_event_deletion_request(
+    request_id: int,
+    data: EventDeletionRequestReview,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    try:
+        request = db.scalar(
+            select(EventDeletionRequest)
+            .where(EventDeletionRequest.id == request_id)
+            .with_for_update()
+        )
+
+        if request is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Pengajuan penghapusan tidak ditemukan.",
+            )
+
+        if request.status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pengajuan ini sudah diproses.",
+            )
+
+        event = db.scalar(
+            select(Event)
+            .where(Event.id == request.event_id)
+            .with_for_update()
+        )
+
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan.",
+            )
+
+        if event.created_by != request.requested_by:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Pengaju bukan pemilik event.",
+            )
+
+        if data.status == "approved":
+            event.is_deleted = True
+            event.deleted_at = datetime.now(timezone.utc)
+            event.deleted_by = current_admin.id
+
+        request.status = data.status
+        request.reviewed_by = current_admin.id
+        request.reviewed_at = datetime.now(timezone.utc)
+
+        request.rejection_reason = (
+            data.rejection_reason.strip()
+            if data.status == "rejected"
+            else None
+        )
+
+        db.commit()
+
+        return {
+            "message": (
+                "Penghapusan event berhasil disetujui."
+                if data.status == "approved"
+                else "Pengajuan penghapusan event ditolak."
+            ),
+            "event_id": event.id,
+            "is_deleted": event.is_deleted,
+            "request_id": request.id,
+            "status": request.status,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal meninjau penghapusan event: request_id=%s",
+            request_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pengajuan penghapusan event gagal diproses.",
+        )
+
+
+# =========================================================
+# CANCEL EVENT — SUPER ADMIN
 # POST /events/{event_id}/cancel
 # =========================================================
 
@@ -493,19 +1626,22 @@ def cancel_event(
     try:
         event = db.scalar(
             select(Event)
-            .where(Event.id == event_id)
+            .where(
+                Event.id == event_id,
+                Event.is_deleted.is_(False),
+            )
             .with_for_update()
         )
 
         if event is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan",
+                detail="Event tidak ditemukan.",
             )
 
         if event.is_cancelled:
             return {
-                "message": "Event sudah dibatalkan",
+                "message": "Event sudah dibatalkan.",
                 "event_id": event.id,
                 "is_cancelled": True,
             }
@@ -588,68 +1724,11 @@ def cancel_event(
         db.rollback()
 
         logger.exception(
-            "ERROR CANCEL EVENT: event_id=%s",
+            "Gagal membatalkan event: event_id=%s",
             event_id,
         )
 
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Event gagal dibatalkan",
-        )
-
-
-# =========================================================
-# DELETE EVENT PERMANEN — ADMIN
-# DELETE /events/{event_id}
-# =========================================================
-
-@router.delete("/{event_id}")
-def delete_event(
-    event_id: int,
-    db: Session = Depends(get_db),
-    admin: User = Depends(require_admin),
-):
-    try:
-        event = db.scalar(
-            select(Event)
-            .where(Event.id == event_id)
-            .with_for_update()
-        )
-
-        if event is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Event tidak ditemukan",
-            )
-
-        permanently_delete_event(
-            db=db,
-            event_id=event_id,
-        )
-
-        db.commit()
-
-        return {
-            "message": (
-                "Event, kelas tiket, order, dan pembayaran "
-                "berhasil dihapus permanen."
-            ),
-            "event_id": event_id,
-        }
-
-    except HTTPException:
-        db.rollback()
-        raise
-
-    except SQLAlchemyError:
-        db.rollback()
-
-        logger.exception(
-            "ERROR DELETE EVENT PERMANENT: event_id=%s",
-            event_id,
-        )
-
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Event gagal dihapus permanen",
+            detail="Event gagal dibatalkan.",
         )
