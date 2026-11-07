@@ -1,9 +1,10 @@
+
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
@@ -30,9 +31,22 @@ EXPIRATION_SECONDS = 60
 # ============================================================
 
 class OrderCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     event_id: int = Field(gt=0)
     quantity: int = Field(gt=0)
     ticket_class_id: int = Field(gt=0)
+
+    @field_validator("quantity")
+    @classmethod
+    def validate_quantity(cls, value: int):
+        if isinstance(value, bool):
+            raise ValueError("Jumlah tiket harus berupa bilangan bulat.")
+
+        if value <= 0:
+            raise ValueError("Jumlah tiket harus lebih dari 0.")
+
+        return value
 
 
 class OrderResponse(BaseModel):
@@ -170,7 +184,7 @@ def expire_order_if_needed(
     order: Order,
 ) -> bool:
     """
-    Membatalkan pesanan pending yang sudah kedaluwarsa.
+    Membatalkan order pending yang sudah kedaluwarsa.
 
     Stok dikembalikan hanya jika stock_reserved=True.
     Fungsi ini tidak melakukan commit.
@@ -184,6 +198,10 @@ def expire_order_if_needed(
 
     if order.stock_reserved:
         restore_order_stock(db, order)
+
+        # restore_order_stock juga mengubah stock_reserved
+        # menjadi False. Penetapan ini untuk memastikan
+        # status reservasi tidak tertinggal.
         order.stock_reserved = False
 
     order.status = "cancelled"
@@ -259,6 +277,7 @@ def payment_to_dict(
 
 # ============================================================
 # CREATE ORDER
+# POST /orders/
 # ============================================================
 
 @router.post(
@@ -274,8 +293,8 @@ def create_order(
     require_user(current_user)
 
     try:
-        # Kunci event agar tidak terjadi pemesanan bersamaan
-        # dengan pembatalan atau perubahan event.
+        # Kunci event untuk mengurangi risiko transaksi
+        # bersamaan ketika event sedang diubah.
         event = db.scalar(
             select(Event)
             .where(
@@ -319,17 +338,22 @@ def create_order(
 
         if ticket_class.stock < data.quantity:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     "Stok kelas tiket tidak mencukupi. "
                     f"Sisa stok: {ticket_class.stock}."
                 ),
             )
 
-        total_price = (
-            Decimal(str(ticket_class.price))
-            * data.quantity
-        )
+        ticket_price = Decimal(str(ticket_class.price))
+
+        if not ticket_price.is_finite() or ticket_price < 0:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Harga kelas tiket tidak valid.",
+            )
+
+        total_price = ticket_price * data.quantity
 
         now = utc_now()
 
@@ -347,11 +371,13 @@ def create_order(
             stock_reserved=True,
         )
 
-        # Kurangi stok kelas tiket.
+        # Reservasi stok dilakukan dalam transaksi database
+        # yang sama dengan pembuatan order.
         ticket_class.stock -= data.quantity
 
         db.add(order)
         db.flush()
+
         db.commit()
         db.refresh(order)
 
@@ -388,6 +414,7 @@ def create_order(
 
 # ============================================================
 # GET MY ORDERS (USER)
+# GET /orders/
 # ============================================================
 
 @router.get(
@@ -463,6 +490,7 @@ def get_my_orders(
 
 # ============================================================
 # GET ORDERS (SUPER ADMIN / ADMIN EVENT)
+# GET /orders/admin/all
 # ============================================================
 
 @router.get(
@@ -485,8 +513,8 @@ def get_all_orders_admin(
             )
         )
 
-        # Admin Event hanya dapat melihat transaksi dari
-        # event yang dibuat oleh akun tersebut.
+        # Admin Event hanya melihat transaksi dari event
+        # yang dibuat oleh akun tersebut.
         if current_user.role == "admin_event":
             query = query.where(
                 Event.created_by == current_user.id
@@ -545,9 +573,9 @@ def get_all_orders_admin(
             detail="Terjadi kesalahan saat memuat data pesanan.",
         )
 
-
 # ============================================================
 # GET ORDER DETAIL
+# GET /orders/{order_id}
 # ============================================================
 
 @router.get(
@@ -567,7 +595,9 @@ def get_order_detail(
                 joinedload(Order.event),
                 joinedload(Order.user),
             )
-            .where(Order.id == order_id)
+            .where(
+                Order.id == order_id
+            )
         )
 
         if current_user.role == "user":
@@ -601,6 +631,7 @@ def get_order_detail(
                 ),
             )
 
+        # Periksa kedaluwarsa sebelum mengembalikan detail.
         if expire_order_if_needed(db, order):
             db.commit()
             db.refresh(order)
@@ -655,6 +686,7 @@ def get_order_detail(
 
 # ============================================================
 # CANCEL ORDER (USER)
+# DELETE /orders/{order_id}
 # ============================================================
 
 @router.delete("/{order_id}")
@@ -689,6 +721,18 @@ def cancel_order(
                     "dapat dibatalkan."
                 ),
             )
+
+        # Jika order sudah kedaluwarsa, proses sebagai order
+        # kedaluwarsa dan kembalikan stok hanya sekali.
+        if is_expired(order):
+            expire_order_if_needed(db, order)
+            db.commit()
+
+            return {
+                "message": "Pesanan sudah kedaluwarsa dan dibatalkan.",
+                "order_id": order.id,
+                "status": order.status,
+            }
 
         payments = db.scalars(
             select(Payment)

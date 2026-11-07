@@ -1,7 +1,8 @@
-import logging
-from decimal import Decimal
 
-from pydantic import BaseModel, Field, ConfigDict
+import logging
+from decimal import Decimal, InvalidOperation
+
+from pydantic import BaseModel, Field, ConfigDict, field_validator
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy import select, func
 from sqlalchemy.exc import SQLAlchemyError
@@ -31,6 +32,8 @@ router = APIRouter(
 # =========================================================
 
 class TicketClassCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(
         min_length=1,
         max_length=30,
@@ -43,6 +46,28 @@ class TicketClassCreate(BaseModel):
     available_tickets: int = Field(
         ge=0,
     )
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, value: Decimal):
+        if not value.is_finite():
+            raise ValueError("Harga harus berupa angka yang valid.")
+
+        if value < 0:
+            raise ValueError("Harga tidak boleh negatif.")
+
+        return value
+
+    @field_validator("available_tickets")
+    @classmethod
+    def validate_stock(cls, value: int):
+        if isinstance(value, bool):
+            raise ValueError("Stok harus berupa bilangan bulat.")
+
+        if value < 0:
+            raise ValueError("Stok tidak boleh negatif.")
+
+        return value
 
 
 class TicketClassUpdate(BaseModel):
@@ -65,6 +90,34 @@ class TicketClassUpdate(BaseModel):
         default=None,
         ge=0,
     )
+
+    @field_validator("price")
+    @classmethod
+    def validate_price(cls, value):
+        if value is None:
+            return value
+
+        if not value.is_finite():
+            raise ValueError("Harga harus berupa angka yang valid.")
+
+        if value < 0:
+            raise ValueError("Harga tidak boleh negatif.")
+
+        return value
+
+    @field_validator("available_tickets")
+    @classmethod
+    def validate_stock(cls, value):
+        if value is None:
+            return value
+
+        if isinstance(value, bool):
+            raise ValueError("Stok harus berupa bilangan bulat.")
+
+        if value < 0:
+            raise ValueError("Stok tidak boleh negatif.")
+
+        return value
 
 
 # =========================================================
@@ -327,8 +380,7 @@ def create_change_request(
     Menyimpan operasi kelas tiket sebagai EventUpdateRequest.
 
     Perubahan belum diterapkan ke TicketClass aktif.
-
-    Format ini harus tetap cocok dengan
+    Format operasi disesuaikan dengan
     apply_ticket_class_changes() di event_routes.py.
     """
 
@@ -347,7 +399,6 @@ def create_change_request(
     db.refresh(request)
 
     return request
-
 
 # =========================================================
 # GET ALL TICKET CLASSES
@@ -539,7 +590,7 @@ def update_ticket_class(
                 detail="Tidak ada data yang diubah.",
             )
 
-        # Jangan izinkan null untuk field yang dikirim.
+        # Field yang dikirim tidak boleh bernilai null.
         for key, value in changes.items():
             if value is None:
                 raise HTTPException(
@@ -581,7 +632,7 @@ def update_ticket_class(
             },
         }
 
-        # Admin Event mengajukan perubahan.
+        # Admin Event hanya mengajukan perubahan.
         if current_user.role == "admin_event":
             request = create_change_request(
                 db,
@@ -660,6 +711,8 @@ def delete_ticket_class(
             lock=True,
         )
 
+        # Kelas tiket yang memiliki riwayat order tidak boleh
+        # dihapus, termasuk jika order sudah dibatalkan.
         ensure_ticket_class_has_no_orders(
             db,
             ticket_class_id,

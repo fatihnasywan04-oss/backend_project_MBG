@@ -1,3 +1,4 @@
+
 import logging
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -35,6 +36,8 @@ EXPIRATION_SECONDS = 60
 # ============================================================
 
 class PaymentCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     order_id: int = Field(gt=0)
 
     payment_method: Literal[
@@ -100,7 +103,10 @@ def require_user(current_user: User) -> None:
     if current_user.role != "user":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Fitur pembayaran hanya tersedia untuk akun pengguna.",
+            detail=(
+                "Fitur pembayaran hanya tersedia "
+                "untuk akun pengguna."
+            ),
         )
 
 
@@ -190,11 +196,9 @@ def fail_expired_order(
     order: Order,
 ) -> bool:
     """
-    Membatalkan pesanan pending yang sudah kedaluwarsa.
+    Membatalkan order pending yang sudah kedaluwarsa.
 
     Stok dikembalikan hanya jika stock_reserved=True.
-    Setelah stok dikembalikan, stock_reserved menjadi False.
-
     Semua perubahan dilakukan dalam transaksi pemanggil.
     Fungsi ini tidak melakukan commit.
     """
@@ -236,7 +240,9 @@ def get_order_for_update(
 ) -> Order | None:
     return db.scalar(
         select(Order)
-        .where(Order.id == order_id)
+        .where(
+            Order.id == order_id,
+        )
         .with_for_update()
     )
 
@@ -247,13 +253,16 @@ def get_payment_for_update(
 ) -> Payment | None:
     return db.scalar(
         select(Payment)
-        .where(Payment.id == payment_id)
+        .where(
+            Payment.id == payment_id,
+        )
         .with_for_update()
     )
 
 
 # ============================================================
 # CREATE PAYMENT
+# POST /payments/
 # ============================================================
 
 @router.post(
@@ -269,6 +278,9 @@ def create_payment(
     require_user(current_user)
 
     try:
+        # Kunci order terlebih dahulu agar pembuatan
+        # pembayaran tidak bertabrakan dengan pembatalan
+        # atau konfirmasi pembayaran.
         order = get_order_for_update(
             db,
             payload.order_id,
@@ -292,6 +304,7 @@ def create_payment(
                 ),
             )
 
+        # Periksa masa berlaku order.
         if order_is_expired(order):
             fail_expired_order(
                 db,
@@ -311,13 +324,27 @@ def create_payment(
 
         if not order.stock_reserved:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     "Stok tiket untuk pesanan ini "
                     "tidak sedang direservasi."
                 ),
             )
 
+        # Cegah nominal pembayaran yang tidak sesuai
+        # dengan total harga pesanan.
+        order_amount = Decimal(str(order.total_price))
+
+        if (
+            not order_amount.is_finite()
+            or order_amount < 0
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Total harga pesanan tidak valid.",
+            )
+
+        # Cari pembayaran pending yang sudah ada.
         existing_payment = db.scalar(
             select(Payment)
             .where(
@@ -336,6 +363,8 @@ def create_payment(
                 payload.payment_provider
             )
 
+            existing_payment.amount = order_amount
+
             db.commit()
             db.refresh(existing_payment)
 
@@ -347,7 +376,7 @@ def create_payment(
             order_id=order.id,
             method=payload.payment_method,
             payment_provider=payload.payment_provider,
-            amount=order.total_price,
+            amount=order_amount,
             status="pending",
         )
 
@@ -385,9 +414,9 @@ def create_payment(
             detail="Terjadi kesalahan saat membuat pembayaran.",
         )
 
-
 # ============================================================
 # CONFIRM PAYMENT
+# POST /payments/{payment_id}/confirm
 # ============================================================
 
 @router.post("/{payment_id}/confirm")
@@ -406,7 +435,8 @@ def confirm_payment(
     require_user(current_user)
 
     try:
-        # Ambil informasi awal untuk mendapatkan order_id.
+        # Ambil informasi awal untuk mengetahui order_id.
+        # Penguncian dilakukan setelah order ditemukan.
         initial_payment = db.get(
             Payment,
             payment_id,
@@ -488,6 +518,7 @@ def confirm_payment(
                 ),
             )
 
+        # Periksa kedaluwarsa sebelum mengonfirmasi pembayaran.
         if order_is_expired(order):
             fail_expired_order(
                 db,
@@ -506,7 +537,7 @@ def confirm_payment(
 
         if not order.stock_reserved:
             raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
+                status_code=status.HTTP_409_CONFLICT,
                 detail=(
                     "Stok tiket untuk pesanan ini "
                     "tidak sedang direservasi. "
@@ -514,15 +545,32 @@ def confirm_payment(
                 ),
             )
 
-        # Stok sudah dikurangi saat order dibuat.
-        # Jangan mengurangi stok untuk kedua kalinya.
+        # Pastikan nominal pembayaran sesuai dengan order.
+        expected_amount = Decimal(str(order.total_price))
+        payment_amount = Decimal(str(payment.amount))
+
+        if (
+            not expected_amount.is_finite()
+            or not payment_amount.is_finite()
+            or payment_amount != expected_amount
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Nominal pembayaran tidak sesuai "
+                    "dengan total harga pesanan."
+                ),
+            )
+
+        # Pembayaran simulasi berhasil.
         payment.status = "success"
         payment.paid_at = utc_now()
 
         order.status = "paid"
 
-        # Reservasi sementara selesai.
-        # Stok tetap terpakai dan tidak dikembalikan.
+        # Stok sudah dikurangi ketika order dibuat.
+        # Jangan mengurangi stok untuk kedua kalinya.
+        # Reservasi sementara berubah menjadi tiket terjual.
         order.stock_reserved = False
 
         db.commit()
@@ -569,6 +617,7 @@ def confirm_payment(
 
 # ============================================================
 # GET MY PAYMENTS
+# GET /payments/my
 # ============================================================
 
 @router.get(

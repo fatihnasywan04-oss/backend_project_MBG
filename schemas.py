@@ -1,3 +1,4 @@
+
 from datetime import datetime
 from decimal import Decimal
 from typing import Any, Literal
@@ -87,13 +88,15 @@ class AdminEventApplicationReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_rejection_reason(self):
-        if (
-            self.status == "rejected"
-            and not (self.rejection_reason or "").strip()
-        ):
-            raise ValueError(
-                "Alasan penolakan wajib diisi."
-            )
+        if self.status == "rejected":
+            reason = (self.rejection_reason or "").strip()
+
+            if not reason:
+                raise ValueError(
+                    "Alasan penolakan wajib diisi."
+                )
+
+            self.rejection_reason = reason
 
         return self
 
@@ -133,11 +136,18 @@ class EventCreate(BaseModel):
 
     end_date: datetime | None = None
 
-    price: Decimal = Field(ge=0)
+    price: Decimal = Field(
+        ge=0,
+    )
 
-    available_tickets: int = Field(ge=0)
+    available_tickets: int = Field(
+        ge=0,
+    )
 
-    image_url: str | None = None
+    image_url: str | None = Field(
+        default=None,
+        max_length=500,
+    )
 
     @model_validator(mode="after")
     def validate_event_dates(self):
@@ -201,7 +211,10 @@ class EventUpdate(BaseModel):
         ge=0,
     )
 
-    image_url: str | None = None
+    image_url: str | None = Field(
+        default=None,
+        max_length=500,
+    )
 
     @model_validator(mode="after")
     def validate_event_dates(self):
@@ -271,16 +284,17 @@ class EventApprovalReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_rejection_reason(self):
-        if (
-            self.status == "rejected"
-            and not (self.rejection_reason or "").strip()
-        ):
-            raise ValueError(
-                "Alasan penolakan wajib diisi."
-            )
+        if self.status == "rejected":
+            reason = (self.rejection_reason or "").strip()
+
+            if not reason:
+                raise ValueError(
+                    "Alasan penolakan wajib diisi."
+                )
+
+            self.rejection_reason = reason
 
         return self
-
 
 # =========================================================
 # EVENT UPDATE REQUEST
@@ -289,7 +303,37 @@ class EventApprovalReview(BaseModel):
 class EventUpdateRequestCreate(BaseModel):
     event: EventUpdate | None = None
 
-    # Operasi kelas tiket yang diajukan.
+    # Operasi perubahan kelas tiket.
+    #
+    # Format:
+    # create:
+    # {
+    #     "action": "create",
+    #     "ticket_class_id": None,
+    #     "data": {
+    #         "name": "VIP",
+    #         "price": "150000",
+    #         "available_tickets": 100
+    #     }
+    # }
+    #
+    # update:
+    # {
+    #     "action": "update",
+    #     "ticket_class_id": 1,
+    #     "data": {
+    #         "name": "VIP",
+    #         "price": "175000"
+    #     }
+    # }
+    #
+    # delete:
+    # {
+    #     "action": "delete",
+    #     "ticket_class_id": 1,
+    #     "data": {}
+    # }
+
     ticket_classes: list[dict[str, Any]] = Field(
         default_factory=list,
     )
@@ -307,6 +351,58 @@ class EventUpdateRequestCreate(BaseModel):
                 "Pengajuan harus memiliki perubahan event "
                 "atau perubahan kelas tiket."
             )
+
+        for operation in self.ticket_classes:
+            action = operation.get("action")
+            ticket_class_id = operation.get("ticket_class_id")
+            data = operation.get("data")
+
+            if action not in ["create", "update", "delete"]:
+                raise ValueError(
+                    "Operasi kelas tiket tidak valid."
+                )
+
+            if not isinstance(data, dict):
+                raise ValueError(
+                    "Data perubahan kelas tiket harus berupa object."
+                )
+
+            if action == "create":
+                if ticket_class_id is not None:
+                    raise ValueError(
+                        "ticket_class_id untuk operasi create "
+                        "harus bernilai null."
+                    )
+
+                if not data.get("name"):
+                    raise ValueError(
+                        "Nama kelas tiket wajib diisi."
+                    )
+
+                if "price" not in data:
+                    raise ValueError(
+                        "Harga kelas tiket wajib diisi."
+                    )
+
+                if "available_tickets" not in data:
+                    raise ValueError(
+                        "Stok kelas tiket wajib diisi."
+                    )
+
+            elif action in ["update", "delete"]:
+                if (
+                    not isinstance(ticket_class_id, int)
+                    or isinstance(ticket_class_id, bool)
+                    or ticket_class_id <= 0
+                ):
+                    raise ValueError(
+                        "ID kelas tiket tidak valid."
+                    )
+
+            if action == "delete" and data:
+                raise ValueError(
+                    "Operasi delete tidak membutuhkan data perubahan."
+                )
 
         return self
 
@@ -339,13 +435,15 @@ class EventUpdateRequestReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_rejection_reason(self):
-        if (
-            self.status == "rejected"
-            and not (self.rejection_reason or "").strip()
-        ):
-            raise ValueError(
-                "Alasan penolakan wajib diisi."
-            )
+        if self.status == "rejected":
+            reason = (self.rejection_reason or "").strip()
+
+            if not reason:
+                raise ValueError(
+                    "Alasan penolakan wajib diisi."
+                )
+
+            self.rejection_reason = reason
 
         return self
 
@@ -389,16 +487,23 @@ class EventDeletionRequestReview(BaseModel):
 
     @model_validator(mode="after")
     def validate_rejection_reason(self):
-        if (
-            self.status == "rejected"
-            and not (self.rejection_reason or "").strip()
-        ):
-            raise ValueError(
-                "Alasan penolakan wajib diisi."
-            )
+        if self.status == "rejected":
+            reason = (self.rejection_reason or "").strip()
+
+            if not reason:
+                raise ValueError(
+                    "Alasan penolakan wajib diisi."
+                )
+
+            self.rejection_reason = reason
 
         return self
-    
+
+
+# =========================================================
+# CREATE ADMIN EVENT ACCOUNT
+# =========================================================
+
 class AdminEventAccountCreate(BaseModel):
     name: str = Field(
         min_length=2,

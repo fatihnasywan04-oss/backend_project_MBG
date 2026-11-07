@@ -1,3 +1,4 @@
+
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -132,6 +133,14 @@ def count_rows(
 def get_owned_event_ids_query(
     current_user: User,
 ):
+    """
+    Mengambil ID event milik Admin Event.
+
+    Tidak memfilter approval_status, is_cancelled,
+    atau is_deleted agar riwayat transaksi tetap
+    terhubung dengan pemilik event.
+    """
+
     query = select(Event.id)
 
     if current_user.role == "admin_event":
@@ -145,6 +154,10 @@ def get_owned_event_ids_query(
 def get_order_scope_conditions(
     current_user: User,
 ):
+    """
+    Membatasi data pesanan berdasarkan kepemilikan event.
+    """
+
     if current_user.role == "admin":
         return []
 
@@ -158,6 +171,10 @@ def get_order_scope_conditions(
 def get_payment_scope_conditions(
     current_user: User,
 ):
+    """
+    Membatasi data pembayaran berdasarkan kepemilikan event.
+    """
+
     if current_user.role == "admin":
         return []
 
@@ -267,6 +284,12 @@ def review_admin_event_application(
                 ),
             )
 
+        if data.status not in ["approved", "rejected"]:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="Status review tidak valid.",
+            )
+
         applicant.admin_event_status = data.status
         applicant.admin_event_reviewed_by = current_admin.id
         applicant.admin_event_reviewed_at = datetime.now(
@@ -279,8 +302,21 @@ def review_admin_event_application(
 
         else:
             applicant.role = "user"
-            applicant.admin_event_rejection_reason = (
+
+            rejection_reason = (
                 data.rejection_reason.strip()
+                if data.rejection_reason
+                else ""
+            )
+
+            if not rejection_reason:
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail="Alasan penolakan wajib diisi.",
+                )
+
+            applicant.admin_event_rejection_reason = (
+                rejection_reason
             )
 
         db.commit()
@@ -396,7 +432,13 @@ def get_admin_dashboard(
     try:
         is_super_admin = current_user.role == "admin"
 
-        event_conditions = []
+        # -------------------------------------------------
+        # EVENT STATISTICS
+        # -------------------------------------------------
+
+        event_conditions = [
+            Event.is_deleted.is_(False),
+        ]
 
         if not is_super_admin:
             event_conditions.append(
@@ -407,8 +449,12 @@ def get_admin_dashboard(
             db,
             Event,
             *event_conditions,
-            Event.is_deleted.is_(False),
         )
+
+        # -------------------------------------------------
+        # USER STATISTICS
+        # Hanya Super Admin yang mendapatkan jumlah user.
+        # -------------------------------------------------
 
         total_users = (
             count_rows(
@@ -420,11 +466,11 @@ def get_admin_dashboard(
             else 0
         )
 
-        order_conditions = get_order_scope_conditions(
-            current_user
-        )
+        # -------------------------------------------------
+        # ORDER STATISTICS
+        # -------------------------------------------------
 
-        payment_conditions = get_payment_scope_conditions(
+        order_conditions = get_order_scope_conditions(
             current_user
         )
 
@@ -448,6 +494,14 @@ def get_admin_dashboard(
             Order.status == "paid",
         )
 
+        # -------------------------------------------------
+        # PAYMENT STATISTICS
+        # -------------------------------------------------
+
+        payment_conditions = get_payment_scope_conditions(
+            current_user
+        )
+
         total_payments = count_rows(
             db,
             Payment,
@@ -468,6 +522,11 @@ def get_admin_dashboard(
             Payment.status == "success",
         )
 
+        # -------------------------------------------------
+        # TICKETS SOLD
+        # Hanya pesanan dengan status paid.
+        # -------------------------------------------------
+
         tickets_sold = db.scalar(
             select(
                 func.coalesce(
@@ -479,6 +538,11 @@ def get_admin_dashboard(
                 Order.status == "paid",
             )
         ) or 0
+
+        # -------------------------------------------------
+        # REVENUE
+        # Pembayaran sukses dari pesanan yang sudah paid.
+        # -------------------------------------------------
 
         revenue = db.scalar(
             select(
@@ -494,6 +558,7 @@ def get_admin_dashboard(
             .where(
                 *order_conditions,
                 Payment.status == "success",
+                Order.status == "paid",
             )
         ) or Decimal("0")
 
@@ -510,6 +575,7 @@ def get_admin_dashboard(
             "revenue": revenue,
         }
 
+        # Jumlah pengajuan hanya ditampilkan untuk Super Admin.
         if is_super_admin:
             response["pending_admin_event_applications"] = (
                 count_rows(
@@ -533,7 +599,6 @@ def get_admin_dashboard(
             detail="Dashboard admin gagal dimuat.",
         )
 
-
 # =========================================================
 # GET ALL ORDERS
 # GET /admin/orders
@@ -547,10 +612,23 @@ def get_all_orders(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_event),
 ):
+    """
+    Super Admin melihat seluruh pesanan.
+
+    Admin Event hanya melihat pesanan dari event
+    yang dibuat oleh akun tersebut.
+
+    Pesanan tetap ditampilkan meskipun event sudah
+    dibatalkan atau dihapus secara soft-delete.
+    """
+
     try:
         query = (
             select(Order)
-            .join(Event, Order.event_id == Event.id)
+            .join(
+                Event,
+                Order.event_id == Event.id,
+            )
             .options(
                 joinedload(Order.event),
                 joinedload(Order.user),
@@ -622,6 +700,16 @@ def get_all_payments(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin_or_event),
 ):
+    """
+    Super Admin melihat seluruh pembayaran.
+
+    Admin Event hanya melihat pembayaran dari pesanan
+    event miliknya sendiri.
+
+    Riwayat pembayaran tidak difilter berdasarkan
+    status event agar riwayat transaksi tetap tersedia.
+    """
+
     try:
         query = (
             select(Payment)

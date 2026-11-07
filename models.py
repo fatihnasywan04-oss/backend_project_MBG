@@ -1,3 +1,4 @@
+
 from sqlalchemy import (
     Column,
     Integer,
@@ -23,10 +24,28 @@ from database import Base
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String(100), nullable=False)
-    email = Column(String(255), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    name = Column(
+        String(100),
+        nullable=False,
+    )
+
+    email = Column(
+        String(255),
+        unique=True,
+        nullable=False,
+        index=True,
+    )
+
+    password_hash = Column(
+        String(255),
+        nullable=False,
+    )
 
     # user, admin_event, admin
     role = Column(
@@ -47,7 +66,10 @@ class User(Base):
 
     admin_event_reviewed_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
 
@@ -56,7 +78,10 @@ class User(Base):
         nullable=True,
     )
 
-    admin_event_rejection_reason = Column(Text, nullable=True)
+    admin_event_rejection_reason = Column(
+        Text,
+        nullable=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -70,34 +95,46 @@ class User(Base):
             name="check_user_role_valid",
         ),
         CheckConstraint(
-            "admin_event_status IN ('none', 'pending', 'approved', 'rejected')",
+            """
+            admin_event_status IN (
+                'none',
+                'pending',
+                'approved',
+                'rejected'
+            )
+            """,
             name="check_admin_event_status_valid",
         ),
     )
 
+    # Relasi pesanan milik user
     orders = relationship(
         "Order",
         back_populates="user",
     )
 
+    # Relasi event yang dibuat user
     created_events = relationship(
         "Event",
         back_populates="creator",
         foreign_keys="Event.created_by",
     )
 
+    # Relasi reviewer pengajuan Admin Event
     admin_event_reviewed_by_user = relationship(
         "User",
         remote_side="User.id",
         foreign_keys=[admin_event_reviewed_by],
     )
 
+    # Relasi permintaan perubahan event
     event_update_requests = relationship(
         "EventUpdateRequest",
         back_populates="requested_by_user",
         foreign_keys="EventUpdateRequest.requested_by",
     )
 
+    # Relasi permintaan penghapusan event
     event_deletion_requests = relationship(
         "EventDeletionRequest",
         back_populates="requested_by_user",
@@ -112,12 +149,36 @@ class User(Base):
 class Event(Base):
     __tablename__ = "events"
 
-    id = Column(Integer, primary_key=True, index=True)
-    title = Column(String(255), nullable=False)
-    description = Column(Text, nullable=False)
-    location = Column(String(255), nullable=False)
-    category = Column(String(100), nullable=True)
-    instagram_username = Column(String(30), nullable=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
+
+    title = Column(
+        String(255),
+        nullable=False,
+    )
+
+    description = Column(
+        Text,
+        nullable=False,
+    )
+
+    location = Column(
+        String(255),
+        nullable=False,
+    )
+
+    category = Column(
+        String(100),
+        nullable=True,
+    )
+
+    instagram_username = Column(
+        String(30),
+        nullable=True,
+    )
 
     event_date = Column(
         DateTime(timezone=True),
@@ -129,9 +190,20 @@ class Event(Base):
         nullable=True,
     )
 
-    price = Column(Numeric(12, 2), nullable=False)
-    available_tickets = Column(Integer, nullable=False)
-    image_url = Column(String(500), nullable=True)
+    price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
+
+    available_tickets = Column(
+        Integer,
+        nullable=False,
+    )
+
+    image_url = Column(
+        String(500),
+        nullable=True,
+    )
 
     created_by = Column(
         Integer,
@@ -151,6 +223,7 @@ class Event(Base):
         nullable=False,
         default=False,
         server_default="false",
+        index=True,
     )
 
     # pending, approved, rejected
@@ -164,7 +237,10 @@ class Event(Base):
 
     approval_reviewed_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
 
@@ -173,7 +249,10 @@ class Event(Base):
         nullable=True,
     )
 
-    approval_rejection_reason = Column(Text, nullable=True)
+    approval_rejection_reason = Column(
+        Text,
+        nullable=True,
+    )
 
     # Soft delete
     is_deleted = Column(
@@ -191,7 +270,10 @@ class Event(Base):
 
     deleted_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
 
@@ -212,45 +294,58 @@ class Event(Base):
             name="check_event_end_date_valid",
         ),
         CheckConstraint(
-            "approval_status IN ('pending', 'approved', 'rejected')",
+            """
+            approval_status IN (
+                'pending',
+                'approved',
+                'rejected'
+            )
+            """,
             name="check_event_approval_status_valid",
         ),
     )
 
+    # Relasi pembuat event
     creator = relationship(
         "User",
         back_populates="created_events",
         foreign_keys=[created_by],
     )
 
+    # Relasi Super Admin yang menyetujui event
     approval_reviewer = relationship(
         "User",
         foreign_keys=[approval_reviewed_by],
     )
 
+    # Relasi Super Admin yang melakukan soft delete
     deletion_reviewer = relationship(
         "User",
         foreign_keys=[deleted_by],
     )
 
+    # Relasi kelas tiket
     ticket_classes = relationship(
         "TicketClass",
         back_populates="event",
         passive_deletes=True,
     )
 
+    # Relasi pesanan
     orders = relationship(
         "Order",
         back_populates="event",
         passive_deletes=True,
     )
 
+    # Relasi permintaan perubahan
     update_requests = relationship(
         "EventUpdateRequest",
         back_populates="event",
         passive_deletes=True,
     )
 
+    # Relasi permintaan penghapusan
     deletion_requests = relationship(
         "EventDeletionRequest",
         back_populates="event",
@@ -265,17 +360,31 @@ class Event(Base):
 class TicketClass(Base):
     __tablename__ = "ticket_classes"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "events.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
-    name = Column(String(100), nullable=False)
-    price = Column(Numeric(12, 2), nullable=False)
+    name = Column(
+        String(100),
+        nullable=False,
+    )
+
+    price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
 
     # Atribut Python: stock
     # Kolom database: available_tickets
@@ -287,6 +396,7 @@ class TicketClass(Base):
         server_default="0",
     )
 
+    # Alias kompatibilitas kode lama
     available_tickets = synonym("stock")
 
     __table_args__ = (
@@ -319,18 +429,28 @@ class TicketClass(Base):
 class EventUpdateRequest(Base):
     __tablename__ = "event_update_requests"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "events.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
     requested_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "users.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
@@ -351,7 +471,10 @@ class EventUpdateRequest(Base):
 
     reviewed_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
 
@@ -360,7 +483,10 @@ class EventUpdateRequest(Base):
         nullable=True,
     )
 
-    rejection_reason = Column(Text, nullable=True)
+    rejection_reason = Column(
+        Text,
+        nullable=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -370,7 +496,13 @@ class EventUpdateRequest(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected')",
+            """
+            status IN (
+                'pending',
+                'approved',
+                'rejected'
+            )
+            """,
             name="check_event_update_request_status_valid",
         ),
     )
@@ -399,23 +531,36 @@ class EventUpdateRequest(Base):
 class EventDeletionRequest(Base):
     __tablename__ = "event_deletion_requests"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "events.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
     requested_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "users.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
-    reason = Column(Text, nullable=True)
+    reason = Column(
+        Text,
+        nullable=True,
+    )
 
     # pending, approved, rejected
     status = Column(
@@ -428,7 +573,10 @@ class EventDeletionRequest(Base):
 
     reviewed_by = Column(
         Integer,
-        ForeignKey("users.id", ondelete="SET NULL"),
+        ForeignKey(
+            "users.id",
+            ondelete="SET NULL",
+        ),
         nullable=True,
     )
 
@@ -437,7 +585,10 @@ class EventDeletionRequest(Base):
         nullable=True,
     )
 
-    rejection_reason = Column(Text, nullable=True)
+    rejection_reason = Column(
+        Text,
+        nullable=True,
+    )
 
     created_at = Column(
         DateTime(timezone=True),
@@ -447,7 +598,13 @@ class EventDeletionRequest(Base):
 
     __table_args__ = (
         CheckConstraint(
-            "status IN ('pending', 'approved', 'rejected')",
+            """
+            status IN (
+                'pending',
+                'approved',
+                'rejected'
+            )
+            """,
             name="check_event_deletion_request_status_valid",
         ),
     )
@@ -468,7 +625,6 @@ class EventDeletionRequest(Base):
         foreign_keys=[reviewed_by],
     )
 
-
 # =========================================================
 # ORDER
 # =========================================================
@@ -476,38 +632,62 @@ class EventDeletionRequest(Base):
 class Order(Base):
     __tablename__ = "orders"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     user_id = Column(
         Integer,
-        ForeignKey("users.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "users.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
     event_id = Column(
         Integer,
-        ForeignKey("events.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "events.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
     ticket_class_id = Column(
         Integer,
-        ForeignKey("ticket_classes.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "ticket_classes.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
-    quantity = Column(Integer, nullable=False)
-    total_price = Column(Numeric(12, 2), nullable=False)
+    quantity = Column(
+        Integer,
+        nullable=False,
+    )
 
+    total_price = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
+
+    # pending, paid, cancelled
     status = Column(
         String(30),
         nullable=False,
         default="pending",
+        server_default="pending",
+        index=True,
     )
 
+    # True jika stok tiket sudah dikurangi
     stock_reserved = Column(
         Boolean,
         nullable=False,
@@ -535,23 +715,37 @@ class Order(Base):
             "total_price >= 0",
             name="check_order_total_price_nonnegative",
         ),
+        CheckConstraint(
+            """
+            status IN (
+                'pending',
+                'paid',
+                'cancelled'
+            )
+            """,
+            name="check_order_status_valid",
+        ),
     )
 
+    # Relasi pemesan
     user = relationship(
         "User",
         back_populates="orders",
     )
 
+    # Relasi event
     event = relationship(
         "Event",
         back_populates="orders",
     )
 
+    # Relasi kelas tiket
     ticket_class = relationship(
         "TicketClass",
         back_populates="orders",
     )
 
+    # Relasi pembayaran
     payments = relationship(
         "Payment",
         back_populates="order",
@@ -566,16 +760,26 @@ class Order(Base):
 class Payment(Base):
     __tablename__ = "payments"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(
+        Integer,
+        primary_key=True,
+        index=True,
+    )
 
     order_id = Column(
         Integer,
-        ForeignKey("orders.id", ondelete="RESTRICT"),
+        ForeignKey(
+            "orders.id",
+            ondelete="RESTRICT",
+        ),
         nullable=False,
         index=True,
     )
 
-    amount = Column(Numeric(12, 2), nullable=False)
+    amount = Column(
+        Numeric(12, 2),
+        nullable=False,
+    )
 
     # Atribut Python: method
     # Kolom database: payment_method
@@ -585,13 +789,14 @@ class Payment(Base):
         nullable=True,
     )
 
-    # Atribut Python: status
-    # Kolom database: payment_status
+    # pending, success, failed
     status = Column(
         "payment_status",
         String(30),
         nullable=False,
         default="pending",
+        server_default="pending",
+        index=True,
     )
 
     transaction_id = Column(
@@ -624,6 +829,16 @@ class Payment(Base):
         CheckConstraint(
             "amount >= 0",
             name="check_payment_amount_nonnegative",
+        ),
+        CheckConstraint(
+            """
+            payment_status IN (
+                'pending',
+                'success',
+                'failed'
+            )
+            """,
+            name="check_payment_status_valid",
         ),
     )
 

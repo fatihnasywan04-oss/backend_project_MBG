@@ -1,9 +1,18 @@
-from fastapi import APIRouter, Depends, HTTPException, status
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    status,
+)
+from fastapi.security import (
+    HTTPBearer,
+    HTTPAuthorizationCredentials,
+)
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import select
-import jwt
+from jwt.exceptions import InvalidTokenError
 
 from database import get_db
 from models import User
@@ -38,10 +47,17 @@ def get_current_user(
     db: Session = Depends(get_db),
 ) -> User:
 
-    if credentials is None or credentials.scheme.lower() != "bearer":
+    if credentials is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token autentikasi tidak ditemukan. Silakan login kembali.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if credentials.scheme.lower() != "bearer":
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Skema autentikasi tidak valid.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -57,24 +73,21 @@ def get_current_user(
     try:
         payload = decode_access_token(token)
 
-        if not isinstance(payload, dict):
-            raise ValueError("Payload token tidak valid")
-
         subject = payload.get("sub")
 
-        if subject is None:
-            raise ValueError("Token tidak memiliki subject")
+        if not subject:
+            raise ValueError("Token tidak memiliki subject.")
 
         user_id = int(subject)
 
         if user_id <= 0:
-            raise ValueError("ID user tidak valid")
+            raise ValueError("ID user tidak valid.")
 
     except (
-        jwt.InvalidTokenError,
+        InvalidTokenError,
         ValueError,
-        KeyError,
         TypeError,
+        KeyError,
         OverflowError,
     ):
         raise HTTPException(
@@ -92,6 +105,9 @@ def get_current_user(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    # Role dari database menjadi sumber utama hak akses.
+    # Jangan menggunakan role JWT sebagai satu-satunya acuan.
+
     return user
 
 
@@ -108,13 +124,14 @@ def register(
     data: RegisterRequest,
     db: Session = Depends(get_db),
 ):
+
     email = str(data.email).strip().lower()
     name = data.name.strip()
 
     if not name:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Nama tidak boleh kosong",
+            detail="Nama tidak boleh kosong.",
         )
 
     existing_user = db.scalar(
@@ -124,7 +141,7 @@ def register(
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Email sudah terdaftar",
+            detail="Email sudah terdaftar.",
         )
 
     user = User(
@@ -145,7 +162,7 @@ def register(
 
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="Email sudah terdaftar",
+            detail="Email sudah terdaftar.",
         )
 
     except Exception:
@@ -167,19 +184,27 @@ def login(
     data: LoginRequest,
     db: Session = Depends(get_db),
 ):
+
     email = str(data.email).strip().lower()
 
     user = db.scalar(
         select(User).where(User.email == email)
     )
 
-    if user is None or not verify_password(
+    if user is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Email atau password salah.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    if not verify_password(
         data.password,
         user.password_hash,
     ):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Email atau password salah",
+            detail="Email atau password salah.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -207,6 +232,7 @@ def apply_admin_event(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
+
     # Super Admin tidak perlu mengajukan Admin Event.
     if current_user.role == "admin":
         raise HTTPException(
@@ -221,20 +247,28 @@ def apply_admin_event(
             detail="Akun Anda sudah memiliki role Admin Event.",
         )
 
-    # Jangan izinkan pengajuan berulang saat masih pending.
+    # Hanya akun user yang boleh mengajukan.
+    if current_user.role != "user":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Role akun tidak diizinkan mengajukan Admin Event.",
+        )
+
+    # Pengajuan yang masih menunggu persetujuan.
     if current_user.admin_event_status == "pending":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Pengajuan Admin Event Anda masih menunggu persetujuan.",
         )
 
-    # Akun yang sudah disetujui tidak perlu mengajukan ulang.
+    # Pengajuan yang sudah disetujui.
     if current_user.admin_event_status == "approved":
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="Pengajuan Admin Event Anda sudah disetujui.",
         )
 
+    # Status rejected atau none dapat mengajukan kembali.
     current_user.admin_event_status = "pending"
     current_user.admin_event_reviewed_by = None
     current_user.admin_event_reviewed_at = None

@@ -1,8 +1,9 @@
+
 import asyncio
 import logging
 from datetime import datetime, timezone
 
-from sqlalchemy import select, func
+from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 
 from database import SessionLocal
@@ -20,13 +21,14 @@ async def cleanup_expired_events():
     Melakukan soft delete pada event yang sudah selesai.
 
     Ketentuan:
-    - Event yang sudah selesai disembunyikan dari publik.
-    - Data event tidak dihapus permanen.
+    - Hanya event yang sudah disetujui.
+    - Event harus memiliki end_date.
+    - end_date harus sudah melewati waktu sekarang.
+    - Event yang dibatalkan tidak diproses.
+    - Event tidak dihapus secara permanen.
     - TicketClass tetap tersimpan.
     - Order dan Payment tetap tersimpan.
-    - Tidak menghapus riwayat transaksi.
-    - deleted_by bernilai None karena proses dilakukan
-      otomatis oleh sistem.
+    - deleted_by bernilai None karena proses otomatis.
     """
 
     while True:
@@ -35,15 +37,13 @@ async def cleanup_expired_events():
         try:
             now = datetime.now(timezone.utc)
 
-            # Gunakan end_date jika tersedia.
-            # Jika end_date kosong, gunakan event_date.
             expired_events = db.scalars(
                 select(Event)
                 .where(
-                    func.coalesce(
-                        Event.end_date,
-                        Event.event_date,
-                    ) < func.now(),
+                    Event.end_date.is_not(None),
+                    Event.end_date < now,
+                    Event.approval_status == "approved",
+                    Event.is_cancelled.is_(False),
                     Event.is_deleted.is_(False),
                 )
                 .with_for_update(
@@ -67,6 +67,8 @@ async def cleanup_expired_events():
                     "Berhasil melakukan soft delete pada %s event yang sudah selesai.",
                     deleted_count,
                 )
+            else:
+                db.rollback()
 
         except SQLAlchemyError:
             db.rollback()
