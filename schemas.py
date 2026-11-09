@@ -17,26 +17,14 @@ from pydantic import (
 # =========================================================
 
 class RegisterRequest(BaseModel):
-    name: str = Field(
-        min_length=2,
-        max_length=100,
-    )
-
+    name: str = Field(min_length=2, max_length=100)
     email: EmailStr
-
-    password: str = Field(
-        min_length=8,
-        max_length=128,
-    )
+    password: str = Field(min_length=8, max_length=128)
 
 
 class LoginRequest(BaseModel):
     email: EmailStr
-
-    password: str = Field(
-        min_length=1,
-        max_length=128,
-    )
+    password: str = Field(min_length=1, max_length=128)
 
 
 class UserResponse(BaseModel):
@@ -92,11 +80,43 @@ class AdminEventApplicationReview(BaseModel):
             reason = (self.rejection_reason or "").strip()
 
             if not reason:
-                raise ValueError(
-                    "Alasan penolakan wajib diisi."
-                )
+                raise ValueError("Alasan penolakan wajib diisi.")
 
             self.rejection_reason = reason
+
+        return self
+
+
+# =========================================================
+# TICKET CLASS INPUT UNTUK PEMBUATAN EVENT
+# =========================================================
+
+class EventTicketClassCreate(BaseModel):
+    name: str = Field(
+        min_length=1,
+        max_length=30,
+    )
+
+    price: Decimal = Field(
+        ge=0,
+    )
+
+    available_tickets: int = Field(
+        ge=0,
+    )
+
+    @model_validator(mode="after")
+    def validate_ticket_class(self):
+        self.name = self.name.strip()
+
+        if not self.name:
+            raise ValueError("Nama kelas tiket wajib diisi.")
+
+        if not self.price.is_finite():
+            raise ValueError("Harga kelas tiket tidak valid.")
+
+        if isinstance(self.available_tickets, bool):
+            raise ValueError("Stok kelas tiket tidak valid.")
 
         return self
 
@@ -133,9 +153,11 @@ class EventCreate(BaseModel):
     )
 
     event_date: datetime
-
     end_date: datetime | None = None
 
+    # Tetap dipertahankan agar request lama tetap kompatibel.
+    # Jika ticket_classes dikirim, nilai harga dan stok event
+    # akan disesuaikan berdasarkan kelas tiket di event_routes.py.
     price: Decimal = Field(
         ge=0,
     )
@@ -149,15 +171,45 @@ class EventCreate(BaseModel):
         max_length=500,
     )
 
+    # Kelas tiket dikirim bersamaan dengan data event.
+    # Admin Event diwajibkan mengirim minimal satu kelas tiket
+    # oleh endpoint create_event.
+    ticket_classes: list[EventTicketClassCreate] = Field(
+        default_factory=list,
+    )
+
     @model_validator(mode="after")
-    def validate_event_dates(self):
-        if (
-            self.end_date is not None
-            and self.end_date < self.event_date
-        ):
+    def validate_event_data(self):
+        if self.end_date is not None:
+
+            # Pastikan konsistensi timezone.
+            if (
+                (self.event_date.tzinfo is None)
+                != (self.end_date.tzinfo is None)
+            ):
+                raise ValueError(
+                    "Timezone tanggal mulai dan selesai "
+                    "harus konsisten."
+                )
+
+            if self.end_date < self.event_date:
+                raise ValueError(
+                    "Tanggal selesai tidak boleh lebih awal "
+                    "dari tanggal mulai event."
+                )
+
+        if not self.price.is_finite():
+            raise ValueError("Harga event tidak valid.")
+
+        # Validasi nama kelas tiket agar tidak duplikat.
+        normalized_names = [
+            ticket.name.strip().casefold()
+            for ticket in self.ticket_classes
+        ]
+
+        if len(normalized_names) != len(set(normalized_names)):
             raise ValueError(
-                "Tanggal selesai tidak boleh lebih awal "
-                "dari tanggal mulai event."
+                "Nama kelas tiket tidak boleh duplikat."
             )
 
         return self
@@ -198,7 +250,6 @@ class EventUpdate(BaseModel):
     )
 
     event_date: datetime | None = None
-
     end_date: datetime | None = None
 
     price: Decimal | None = Field(
@@ -221,12 +272,27 @@ class EventUpdate(BaseModel):
         if (
             self.event_date is not None
             and self.end_date is not None
-            and self.end_date < self.event_date
         ):
-            raise ValueError(
-                "Tanggal selesai tidak boleh lebih awal "
-                "dari tanggal mulai event."
-            )
+            if (
+                (self.event_date.tzinfo is None)
+                != (self.end_date.tzinfo is None)
+            ):
+                raise ValueError(
+                    "Timezone tanggal mulai dan selesai "
+                    "harus konsisten."
+                )
+
+            if self.end_date < self.event_date:
+                raise ValueError(
+                    "Tanggal selesai tidak boleh lebih awal "
+                    "dari tanggal mulai event."
+                )
+
+        if (
+            self.price is not None
+            and not self.price.is_finite()
+        ):
+            raise ValueError("Harga event tidak valid.")
 
         return self
 
@@ -288,9 +354,7 @@ class EventApprovalReview(BaseModel):
             reason = (self.rejection_reason or "").strip()
 
             if not reason:
-                raise ValueError(
-                    "Alasan penolakan wajib diisi."
-                )
+                raise ValueError("Alasan penolakan wajib diisi.")
 
             self.rejection_reason = reason
 
@@ -303,37 +367,8 @@ class EventApprovalReview(BaseModel):
 class EventUpdateRequestCreate(BaseModel):
     event: EventUpdate | None = None
 
-    # Operasi perubahan kelas tiket.
-    #
-    # Format:
-    # create:
-    # {
-    #     "action": "create",
-    #     "ticket_class_id": None,
-    #     "data": {
-    #         "name": "VIP",
-    #         "price": "150000",
-    #         "available_tickets": 100
-    #     }
-    # }
-    #
-    # update:
-    # {
-    #     "action": "update",
-    #     "ticket_class_id": 1,
-    #     "data": {
-    #         "name": "VIP",
-    #         "price": "175000"
-    #     }
-    # }
-    #
-    # delete:
-    # {
-    #     "action": "delete",
-    #     "ticket_class_id": 1,
-    #     "data": {}
-    # }
-
+    # Operasi perubahan kelas tiket:
+    # create, update, delete
     ticket_classes: list[dict[str, Any]] = Field(
         default_factory=list,
     )
@@ -353,6 +388,12 @@ class EventUpdateRequestCreate(BaseModel):
             )
 
         for operation in self.ticket_classes:
+
+            if not isinstance(operation, dict):
+                raise ValueError(
+                    "Format operasi kelas tiket tidak valid."
+                )
+
             action = operation.get("action")
             ticket_class_id = operation.get("ticket_class_id")
             data = operation.get("data")
@@ -362,16 +403,18 @@ class EventUpdateRequestCreate(BaseModel):
                     "Operasi kelas tiket tidak valid."
                 )
 
-            if not isinstance(data, dict):
-                raise ValueError(
-                    "Data perubahan kelas tiket harus berupa object."
-                )
-
+            # CREATE
             if action == "create":
+
                 if ticket_class_id is not None:
                     raise ValueError(
                         "ticket_class_id untuk operasi create "
                         "harus bernilai null."
+                    )
+
+                if not isinstance(data, dict):
+                    raise ValueError(
+                        "Data kelas tiket baru harus berupa object."
                     )
 
                 if not data.get("name"):
@@ -389,7 +432,9 @@ class EventUpdateRequestCreate(BaseModel):
                         "Stok kelas tiket wajib diisi."
                     )
 
-            elif action in ["update", "delete"]:
+            # UPDATE
+            elif action == "update":
+
                 if (
                     not isinstance(ticket_class_id, int)
                     or isinstance(ticket_class_id, bool)
@@ -399,10 +444,30 @@ class EventUpdateRequestCreate(BaseModel):
                         "ID kelas tiket tidak valid."
                     )
 
-            if action == "delete" and data:
-                raise ValueError(
-                    "Operasi delete tidak membutuhkan data perubahan."
-                )
+                if not isinstance(data, dict) or not data:
+                    raise ValueError(
+                        "Data perubahan kelas tiket wajib diisi."
+                    )
+
+            # DELETE
+            elif action == "delete":
+
+                if (
+                    not isinstance(ticket_class_id, int)
+                    or isinstance(ticket_class_id, bool)
+                    or ticket_class_id <= 0
+                ):
+                    raise ValueError(
+                        "ID kelas tiket tidak valid."
+                    )
+
+                # Operasi delete tidak membutuhkan data.
+                # Jika data dikirim, nilainya harus object kosong.
+                if data is not None and data != {}:
+                    raise ValueError(
+                        "Operasi delete tidak membutuhkan "
+                        "data perubahan."
+                    )
 
         return self
 
@@ -439,9 +504,7 @@ class EventUpdateRequestReview(BaseModel):
             reason = (self.rejection_reason or "").strip()
 
             if not reason:
-                raise ValueError(
-                    "Alasan penolakan wajib diisi."
-                )
+                raise ValueError("Alasan penolakan wajib diisi.")
 
             self.rejection_reason = reason
 
@@ -491,9 +554,7 @@ class EventDeletionRequestReview(BaseModel):
             reason = (self.rejection_reason or "").strip()
 
             if not reason:
-                raise ValueError(
-                    "Alasan penolakan wajib diisi."
-                )
+                raise ValueError("Alasan penolakan wajib diisi.")
 
             self.rejection_reason = reason
 

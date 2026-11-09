@@ -1,6 +1,6 @@
 
 import logging
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 
 from pydantic import BaseModel, Field, ConfigDict, field_validator
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -34,18 +34,9 @@ router = APIRouter(
 class TicketClassCreate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    name: str = Field(
-        min_length=1,
-        max_length=30,
-    )
-
-    price: Decimal = Field(
-        ge=0,
-    )
-
-    available_tickets: int = Field(
-        ge=0,
-    )
+    name: str = Field(min_length=1, max_length=30)
+    price: Decimal = Field(ge=0)
+    available_tickets: int = Field(ge=0)
 
     @field_validator("price")
     @classmethod
@@ -71,9 +62,7 @@ class TicketClassCreate(BaseModel):
 
 
 class TicketClassUpdate(BaseModel):
-    model_config = ConfigDict(
-        extra="forbid",
-    )
+    model_config = ConfigDict(extra="forbid")
 
     name: str | None = Field(
         default=None,
@@ -154,6 +143,7 @@ def get_event_or_404(
     db: Session,
     current_user: User,
     lock: bool = False,
+    allow_pending: bool = False,
 ):
     query = select(Event).where(
         Event.id == event_id,
@@ -187,13 +177,17 @@ def get_event_or_404(
         )
 
     if event.approval_status != "approved":
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "Kelas tiket hanya dapat dikelola "
-                "pada event yang sudah disetujui."
-            ),
-        )
+        if not (
+            allow_pending
+            and event.approval_status == "pending"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Event belum disetujui atau tidak dapat "
+                    "dikelola."
+                ),
+            )
 
     return event
 
@@ -377,11 +371,10 @@ def create_change_request(
     operation: dict,
 ):
     """
-    Menyimpan operasi kelas tiket sebagai EventUpdateRequest.
+    Menyimpan perubahan kelas tiket sebagai EventUpdateRequest.
 
-    Perubahan belum diterapkan ke TicketClass aktif.
-    Format operasi disesuaikan dengan
-    apply_ticket_class_changes() di event_routes.py.
+    Perubahan untuk event approved belum diterapkan langsung.
+    Perubahan menunggu persetujuan Super Admin.
     """
 
     request = EventUpdateRequest(
@@ -400,8 +393,9 @@ def create_change_request(
 
     return request
 
+
 # =========================================================
-# GET ALL TICKET CLASSES
+# GET ALL TICKET CLASSES - PUBLIK
 # GET /events/{event_id}/ticket-classes
 # =========================================================
 
@@ -458,6 +452,56 @@ def get_ticket_classes(
 
 
 # =========================================================
+# GET TICKET CLASSES - MANAJEMEN ADMIN
+# GET /events/{event_id}/ticket-classes/manage
+# =========================================================
+
+@router.get("/manage")
+def get_managed_ticket_classes(
+    event_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_event_admin),
+):
+    try:
+        get_event_or_404(
+            event_id=event_id,
+            db=db,
+            current_user=current_user,
+            allow_pending=True,
+        )
+
+        ticket_classes = db.scalars(
+            select(TicketClass)
+            .where(
+                TicketClass.event_id == event_id,
+            )
+            .order_by(TicketClass.id.asc())
+        ).all()
+
+        return [
+            serialize_ticket_class(item)
+            for item in ticket_classes
+        ]
+
+    except HTTPException:
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal mengambil kelas tiket untuk manajemen: "
+            "event_id=%s, user_id=%s",
+            event_id,
+            current_user.id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Daftar kelas tiket gagal dimuat.",
+        )
+
+# =========================================================
 # CREATE TICKET CLASS
 # POST /events/{event_id}/ticket-classes
 # =========================================================
@@ -477,11 +521,12 @@ def create_ticket_class(
     current_user: User = Depends(require_event_admin),
 ):
     try:
-        get_event_or_404(
+        event = get_event_or_404(
             event_id,
             db,
             current_user,
             lock=True,
+            allow_pending=True,
         )
 
         name = validate_ticket_class_name(data.name)
@@ -492,6 +537,35 @@ def create_ticket_class(
             name,
         )
 
+        # EVENT MASIH PENDING:
+        # Kelas tiket disimpan langsung karena belum tersedia
+        # untuk pembelian publik.
+        if event.approval_status == "pending":
+            ticket_class = TicketClass(
+                event_id=event_id,
+                name=name,
+                price=data.price,
+                stock=data.available_tickets,
+            )
+
+            db.add(ticket_class)
+            db.commit()
+            db.refresh(ticket_class)
+
+            return {
+                "message": (
+                    "Kelas tiket berhasil ditambahkan. "
+                    "Kelas tiket akan tersedia setelah event "
+                    "disetujui Super Admin."
+                ),
+                "status": "pending",
+                "ticket_class": serialize_ticket_class(
+                    ticket_class
+                ),
+            }
+
+        # EVENT SUDAH APPROVED:
+        # Siapkan operasi untuk pengajuan perubahan.
         operation = {
             "action": "create",
             "ticket_class_id": None,
@@ -502,7 +576,6 @@ def create_ticket_class(
             },
         }
 
-        # Admin Event wajib mengajukan persetujuan.
         if current_user.role == "admin_event":
             request = create_change_request(
                 db,
@@ -520,7 +593,7 @@ def create_ticket_class(
                 "status": request.status,
             }
 
-        # Super Admin dapat membuat langsung.
+        # SUPER ADMIN: SIMPAN LANGSUNG
         ticket_class = TicketClass(
             event_id=event_id,
             name=name,
@@ -542,8 +615,9 @@ def create_ticket_class(
         db.rollback()
 
         logger.exception(
-            "Gagal membuat kelas tiket: event_id=%s",
+            "Gagal membuat kelas tiket: event_id=%s, user_id=%s",
             event_id,
+            current_user.id,
         )
 
         raise HTTPException(
@@ -566,11 +640,12 @@ def update_ticket_class(
     current_user: User = Depends(require_event_admin),
 ):
     try:
-        get_event_or_404(
+        event = get_event_or_404(
             event_id,
             db,
             current_user,
             lock=True,
+            allow_pending=True,
         )
 
         ticket_class = get_ticket_class_or_404(
@@ -590,7 +665,6 @@ def update_ticket_class(
                 detail="Tidak ada data yang diubah.",
             )
 
-        # Field yang dikirim tidak boleh bernilai null.
         for key, value in changes.items():
             if value is None:
                 raise HTTPException(
@@ -619,6 +693,33 @@ def update_ticket_class(
                 changes["available_tickets"],
             )
 
+        # EVENT PENDING:
+        # Perubahan dapat diterapkan langsung.
+        if event.approval_status == "pending":
+            if "name" in changes:
+                ticket_class.name = changes["name"]
+
+            if "price" in changes:
+                ticket_class.price = changes["price"]
+
+            if "available_tickets" in changes:
+                ticket_class.stock = changes["available_tickets"]
+
+            db.commit()
+            db.refresh(ticket_class)
+
+            return {
+                "message": (
+                    "Kelas tiket berhasil diperbarui. "
+                    "Perubahan akan ikut dalam proses "
+                    "persetujuan event."
+                ),
+                "status": "pending",
+                "ticket_class": serialize_ticket_class(
+                    ticket_class
+                ),
+            }
+
         operation = {
             "action": "update",
             "ticket_class_id": ticket_class.id,
@@ -632,7 +733,8 @@ def update_ticket_class(
             },
         }
 
-        # Admin Event hanya mengajukan perubahan.
+        # ADMIN EVENT PADA EVENT APPROVED:
+        # Perubahan harus disetujui Super Admin.
         if current_user.role == "admin_event":
             request = create_change_request(
                 db,
@@ -650,7 +752,7 @@ def update_ticket_class(
                 "status": request.status,
             }
 
-        # Super Admin dapat mengubah langsung.
+        # SUPER ADMIN: PERUBAHAN LANGSUNG
         if "name" in changes:
             ticket_class.name = changes["name"]
 
@@ -673,7 +775,8 @@ def update_ticket_class(
         db.rollback()
 
         logger.exception(
-            "Gagal memperbarui kelas tiket: event_id=%s, ticket_class_id=%s",
+            "Gagal memperbarui kelas tiket: "
+            "event_id=%s, ticket_class_id=%s",
             event_id,
             ticket_class_id,
         )
@@ -697,11 +800,12 @@ def delete_ticket_class(
     current_user: User = Depends(require_event_admin),
 ):
     try:
-        get_event_or_404(
+        event = get_event_or_404(
             event_id,
             db,
             current_user,
             lock=True,
+            allow_pending=True,
         )
 
         ticket_class = get_ticket_class_or_404(
@@ -718,13 +822,28 @@ def delete_ticket_class(
             ticket_class_id,
         )
 
+        # EVENT PENDING:
+        # Penghapusan langsung karena belum ada penjualan publik.
+        if event.approval_status == "pending":
+            db.delete(ticket_class)
+            db.commit()
+
+            return {
+                "message": (
+                    "Kelas tiket berhasil dihapus dari "
+                    "event yang masih menunggu persetujuan."
+                ),
+                "status": "pending",
+            }
+
         operation = {
             "action": "delete",
             "ticket_class_id": ticket_class.id,
             "data": {},
         }
 
-        # Admin Event mengajukan penghapusan.
+        # ADMIN EVENT PADA EVENT APPROVED:
+        # Penghapusan harus menunggu persetujuan Super Admin.
         if current_user.role == "admin_event":
             request = create_change_request(
                 db,
@@ -742,7 +861,7 @@ def delete_ticket_class(
                 "status": request.status,
             }
 
-        # Super Admin dapat menghapus langsung jika belum ada order.
+        # SUPER ADMIN: HAPUS LANGSUNG
         db.delete(ticket_class)
         db.commit()
 
@@ -758,7 +877,8 @@ def delete_ticket_class(
         db.rollback()
 
         logger.exception(
-            "Gagal menghapus kelas tiket: event_id=%s, ticket_class_id=%s",
+            "Gagal menghapus kelas tiket: "
+            "event_id=%s, ticket_class_id=%s",
             event_id,
             ticket_class_id,
         )
