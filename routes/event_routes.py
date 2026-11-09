@@ -1,3 +1,4 @@
+
 import logging
 import uuid
 import re
@@ -31,7 +32,6 @@ from schemas import (
     EventCreate,
     EventUpdate,
     EventResponse,
-    EventApprovalReview,
     EventUpdateRequestResponse,
     EventUpdateRequestReview,
     EventDeletionRequestCreate,
@@ -222,7 +222,16 @@ def validate_event_data(data: dict):
         and data["available_tickets"] is not None
     ):
         try:
-            stock = int(data["available_tickets"])
+            raw_stock = data["available_tickets"]
+
+            if isinstance(raw_stock, bool):
+                raise ValueError
+
+            stock = int(raw_stock)
+
+            if str(raw_stock).strip() != str(stock):
+                raise ValueError
+
         except (TypeError, ValueError):
             raise HTTPException(
                 status_code=422,
@@ -312,6 +321,124 @@ def validate_event_dates(
                     "dari tanggal mulai event."
                 ),
             )
+
+
+# =========================================================
+# CREATE EVENT
+# POST /events/
+# =========================================================
+
+@router.post(
+    "/",
+    response_model=EventResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_event(
+    data: EventCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_event_admin),
+):
+    try:
+        event_data = data.model_dump()
+
+        event_data = validate_event_data(event_data)
+        event_data = normalize_event_dates(event_data)
+
+        # Validasi konsistensi timezone tanggal.
+        start_date = event_data["event_date"]
+        end_date = event_data.get("end_date")
+
+        if end_date is not None:
+            if (
+                (start_date.tzinfo is None)
+                != (end_date.tzinfo is None)
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Format timezone tanggal mulai dan "
+                        "selesai harus konsisten."
+                    ),
+                )
+
+            if end_date < start_date:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Tanggal selesai tidak boleh lebih awal "
+                        "dari tanggal mulai event."
+                    ),
+                )
+
+        # Status event berdasarkan role pengguna.
+        if current_user.role == "admin":
+            approval_status = "approved"
+            approval_reviewed_by = current_user.id
+            approval_reviewed_at = datetime.now(timezone.utc)
+
+        elif current_user.role == "admin_event":
+            approval_status = "pending"
+            approval_reviewed_by = None
+            approval_reviewed_at = None
+
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Role tidak memiliki akses membuat event.",
+            )
+
+        event = Event(
+            title=event_data["title"],
+            description=event_data["description"],
+            location=event_data["location"],
+            category=event_data.get("category"),
+            instagram_username=event_data.get(
+                "instagram_username"
+            ),
+            event_date=start_date,
+            end_date=end_date,
+            price=event_data["price"],
+            available_tickets=event_data["available_tickets"],
+            image_url=event_data.get("image_url"),
+            created_by=current_user.id,
+            approval_status=approval_status,
+            approval_reviewed_by=approval_reviewed_by,
+            approval_reviewed_at=approval_reviewed_at,
+            is_cancelled=False,
+            is_deleted=False,
+        )
+
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+
+        logger.info(
+            "Event berhasil dibuat: event_id=%s, user_id=%s, "
+            "role=%s, approval_status=%s",
+            event.id,
+            current_user.id,
+            current_user.role,
+            event.approval_status,
+        )
+
+        return event
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal membuat event: user_id=%s",
+            current_user.id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Gagal menyimpan event ke database.",
+        )
 
 
 # =========================================================
@@ -542,32 +669,6 @@ def apply_ticket_class_changes(
 ):
     """
     Menjalankan operasi kelas tiket dalam transaksi approval.
-
-    Format operasi:
-
-    {
-        "action": "create",
-        "data": {
-            "name": "VIP",
-            "price": 100000,
-            "available_tickets": 100
-        }
-    }
-
-    {
-        "action": "update",
-        "ticket_class_id": 1,
-        "data": {
-            "name": "VIP",
-            "price": 120000,
-            "available_tickets": 80
-        }
-    }
-
-    {
-        "action": "delete",
-        "ticket_class_id": 1
-    }
     """
 
     if not isinstance(ticket_operations, list):
@@ -591,7 +692,6 @@ def apply_ticket_class_changes(
                 detail="Operasi kelas tiket tidak dikenal.",
             )
 
-        # CREATE TICKET CLASS
         if action == "create":
             ticket_data = operation.get("data")
 
@@ -635,7 +735,6 @@ def apply_ticket_class_changes(
 
             db.add(ticket_class)
 
-        # UPDATE / DELETE TICKET CLASS
         else:
             ticket_class_id = operation.get(
                 "ticket_class_id"
@@ -723,7 +822,6 @@ def apply_ticket_class_changes(
                     )
 
                 db.delete(ticket_class)
-
 
 # =========================================================
 # UPLOAD GAMBAR EVENT
@@ -942,7 +1040,9 @@ def get_event_update_requests(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Daftar pengajuan perubahan gagal dimuat.",
         )
-        # =========================================================
+
+
+# =========================================================
 # REVIEW UPDATE REQUEST
 # POST /events/admin/update-requests/{request_id}/review
 # =========================================================
@@ -1064,12 +1164,9 @@ def review_event_update_request(
                     event_changes["available_tickets"],
                 )
 
-            # Terapkan perubahan event.
             for key, value in event_changes.items():
                 setattr(event, key, value)
 
-            # Terapkan seluruh operasi kelas tiket.
-            # Jika terjadi kesalahan, transaksi dibatalkan.
             apply_ticket_class_changes(
                 db,
                 event,
@@ -1482,10 +1579,7 @@ def cancel_event(
 # =========================================================
 # GET DETAIL EVENT PUBLIK
 # GET /events/{event_id}
-#
-# LETAKKAN DI BAGIAN PALING BAWAH.
-# Agar route /my dan /admin/... tidak tertangkap
-# sebagai parameter event_id.
+# LETAKKAN DI BAGIAN PALING BAWAH
 # =========================================================
 
 @router.get(
