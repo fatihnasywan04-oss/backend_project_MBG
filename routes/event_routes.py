@@ -942,7 +942,8 @@ def get_event_update_requests(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Daftar pengajuan perubahan gagal dimuat.",
         )
-        # =========================================================
+
+# =========================================================
 # REVIEW UPDATE REQUEST
 # POST /events/admin/update-requests/{request_id}/review
 # =========================================================
@@ -1477,7 +1478,281 @@ def cancel_event(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Event gagal dibatalkan.",
         )
+        
+# =========================================================
+# CREATE EVENT
+# POST /events/
+# =========================================================
 
+@router.post(
+    "/",
+    response_model=EventResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_event(
+    data: EventCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_event_admin),
+):
+    event_data = validate_event_data(
+        data.model_dump()
+    )
+
+    try:
+        is_super_admin = current_user.role == "admin"
+
+        event = Event(
+            **event_data,
+            created_by=current_user.id,
+            is_cancelled=False,
+            is_deleted=False,
+            approval_status=(
+                "approved"
+                if is_super_admin
+                else "pending"
+            ),
+            approval_reviewed_by=(
+                current_user.id
+                if is_super_admin
+                else None
+            ),
+            approval_reviewed_at=(
+                datetime.now(timezone.utc)
+                if is_super_admin
+                else None
+            ),
+        )
+
+        db.add(event)
+        db.commit()
+        db.refresh(event)
+
+        return event
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal membuat event."
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Event gagal disimpan.",
+        )
+# =========================================================
+# REVIEW EVENT BARU
+# POST /events/{event_id}/review
+# =========================================================
+
+@router.post("/{event_id}/review")
+def review_event(
+    event_id: int,
+    data: EventApprovalReview,
+    db: Session = Depends(get_db),
+    current_admin: User = Depends(require_admin),
+):
+    try:
+        event = db.scalar(
+            select(Event)
+            .where(Event.id == event_id)
+            .with_for_update()
+        )
+
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan.",
+            )
+
+        if event.approval_status != "pending":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Event ini tidak sedang menunggu persetujuan.",
+            )
+
+        event.approval_status = data.status
+        event.approval_reviewed_by = current_admin.id
+        event.approval_reviewed_at = datetime.now(timezone.utc)
+
+        if data.status == "rejected":
+            event.approval_rejection_reason = (
+                data.rejection_reason.strip()
+            )
+        else:
+            event.approval_rejection_reason = None
+
+        db.commit()
+        db.refresh(event)
+
+        return {
+            "message": (
+                "Event berhasil disetujui."
+                if data.status == "approved"
+                else "Event ditolak."
+            ),
+            "event": event,
+        }
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal meninjau event: event_id=%s",
+            event_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Pengajuan event gagal diproses.",
+        )
+        
+# =========================================================
+# UPDATE EVENT
+# PUT /events/{event_id}
+# =========================================================
+
+@router.put("/{event_id}")
+def update_event(
+    event_id: int,
+    data: EventUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_event_admin),
+):
+    try:
+        event = db.scalar(
+            select(Event)
+            .where(
+                Event.id == event_id,
+                Event.is_deleted.is_(False),
+            )
+            .with_for_update()
+        )
+
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event tidak ditemukan.",
+            )
+
+        ensure_event_owner(
+            event,
+            current_user,
+        )
+
+        if event.is_cancelled:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Event yang dibatalkan tidak dapat diedit.",
+            )
+
+        if event.approval_status != "approved":
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Event belum disetujui.",
+            )
+
+        update_data = data.model_dump(
+            exclude_unset=True,
+        )
+
+        if not update_data:
+            raise HTTPException(
+                status_code=422,
+                detail="Tidak ada perubahan yang dikirim.",
+            )
+
+        unknown_fields = (
+            set(update_data.keys()) - ALLOWED_EVENT_FIELDS
+        )
+
+        if unknown_fields:
+            raise HTTPException(
+                status_code=422,
+                detail="Field perubahan event tidak diizinkan.",
+            )
+
+        update_data = normalize_event_dates(update_data)
+        update_data = validate_event_data(update_data)
+
+        validate_event_dates(
+            update_data,
+            event,
+        )
+
+        # -------------------------------------
+        # ADMIN EVENT: AJUKAN PERUBAHAN
+        # -------------------------------------
+
+        if current_user.role == "admin_event":
+            if "available_tickets" in update_data:
+                validate_event_stock(
+                    db,
+                    event_id,
+                    update_data["available_tickets"],
+                )
+
+            request = EventUpdateRequest(
+                event_id=event.id,
+                requested_by=current_user.id,
+                proposed_data={
+                    "event": update_data,
+                    "ticket_classes": [],
+                },
+                status="pending",
+            )
+
+            db.add(request)
+            db.commit()
+            db.refresh(request)
+
+            return {
+                "message": (
+                    "Perubahan event berhasil diajukan "
+                    "dan menunggu persetujuan Super Admin."
+                ),
+                "request": request,
+            }
+
+        # -------------------------------------
+        # SUPER ADMIN: UPDATE LANGSUNG
+        # -------------------------------------
+
+        if "available_tickets" in update_data:
+            validate_event_stock(
+                db,
+                event_id,
+                update_data["available_tickets"],
+            )
+
+        for key, value in update_data.items():
+            setattr(event, key, value)
+
+        db.commit()
+        db.refresh(event)
+
+        return event
+
+    except HTTPException:
+        db.rollback()
+        raise
+
+    except SQLAlchemyError:
+        db.rollback()
+
+        logger.exception(
+            "Gagal memperbarui event: event_id=%s",
+            event_id,
+        )
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Event gagal diperbarui.",
+        )
 
 # =========================================================
 # GET DETAIL EVENT PUBLIK
