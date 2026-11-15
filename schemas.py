@@ -252,15 +252,6 @@ class EventUpdate(BaseModel):
     event_date: datetime | None = None
     end_date: datetime | None = None
 
-    price: Decimal | None = Field(
-        default=None,
-        ge=0,
-    )
-
-    available_tickets: int | None = Field(
-        default=None,
-        ge=0,
-    )
 
     image_url: str | None = Field(
         default=None,
