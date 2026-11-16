@@ -279,12 +279,6 @@ class EventUpdate(BaseModel):
                     "dari tanggal mulai event."
                 )
 
-        if (
-            self.price is not None
-            and not self.price.is_finite()
-        ):
-            raise ValueError("Harga event tidak valid.")
-
         return self
 
 
