@@ -623,11 +623,27 @@ def update_event(
         # -------------------------------------
 
         if current_user.role == "admin_event":
+            # request = EventUpdateRequest(
+            #     event_id=event.id,
+            #     requested_by=current_user.id,
+            #     proposed_data={
+            #         "event": update_data,
+            #         "ticket_classes": [],
+            #     },
+            #     status="pending",
+            # )
+
+            # temp code
+            serializable_event_data = {
+                key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                for key, value in update_data.items()
+            }
+
             request = EventUpdateRequest(
                 event_id=event.id,
                 requested_by=current_user.id,
                 proposed_data={
-                    "event": update_data,
+                    "event": serializable_event_data,
                     "ticket_classes": [],
                 },
                 status="pending",
@@ -637,12 +653,27 @@ def update_event(
             db.commit()
             db.refresh(request)
 
+            # return {
+            #     "message": (
+            #         "Perubahan event berhasil diajukan "
+            #         "dan menunggu persetujuan Super Admin."
+            #     ),
+            #     "request": request,
+            # }
+
+            # temp code
             return {
                 "message": (
                     "Perubahan event berhasil diajukan "
                     "dan menunggu persetujuan Super Admin."
                 ),
-                "request": request,
+                "request": {
+                    "id": request.id,
+                    "event_id": request.event_id,
+                    "requested_by": request.requested_by,
+                    "proposed_data": request.proposed_data,
+                    "status": request.status,
+                },
             }
 
         # -------------------------------------
@@ -655,7 +686,24 @@ def update_event(
         db.commit()
         db.refresh(event)
 
-        return event
+        # return event
+
+        # temp (for debugging, will be removed later)
+
+        return {
+            "message": "Event berhasil diperbarui.",
+            "event": {
+                "id": event.id,
+                "title": event.title,
+                "description": event.description,
+                "location": event.location,
+                "category": event.category,
+                "image_url": event.image_url,
+                "instagram_username": event.instagram_username,
+                "event_date": event.event_date.isoformat() if event.event_date else None,
+                "end_date": event.end_date.isoformat() if event.end_date else None,
+            },
+        }
 
     except HTTPException:
         db.rollback()
